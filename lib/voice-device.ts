@@ -1,7 +1,4 @@
-// Временные заглушки для типов модулей, пока не установлены правильные типы
-// @ts-ignore
 declare module 'audify';
-// @ts-ignore
 declare module 'wavefile';
 
 import audify from 'audify';
@@ -45,12 +42,6 @@ interface WaveFile {
     toBuffer(): Buffer;
 }
 
-/**
- * Кросс-платформенный менеджер аудио устройств.
- * Использует оптимальный способ работы со звуком для каждой ОС:
- * - Linux: arecord + paplay
- * - Windows/Mac: RtAudio
- */
 class AudioDeviceManager {
     private rtAudio: any;
     private currentInputDevice: AudioDevice | null;
@@ -237,8 +228,8 @@ class AudioDeviceManager {
             try {
                 const buffer = fs.readFileSync(filePath);
                 const wav = new WaveFileLib(buffer);
-                const sampleRate = wav.fmt.sampleRate;
-                const channels = wav.fmt.numChannels;
+                const sampleRate = (wav as any).fmt.sampleRate;
+                const channels = (wav as any).fmt.numChannels;
                 const audioData = wav.getSamples(true, Int16Array);
 
                 let dataIndex = 0;
@@ -299,26 +290,3 @@ class AudioDeviceManager {
 
 // Экспортируем класс
 export default AudioDeviceManager;
-
-// Этот блок выполняется, только если скрипт запущен напрямую
-// Для ES модулей нужно проверять другим способом
-import { fileURLToPath } from 'url';
-import { dirname } from 'path';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-
-if (import.meta.url === `file://${__filename}`) {
-    (async () => {
-        try {
-            const manager = new AudioDeviceManager();
-            await manager.initialize();
-            
-            // Находим и выводим устройства. Логирование уже встроено в метод.
-            manager.findDefaultDevices();
-            manager.listDevices();
-        } catch (error: unknown) {
-            console.error('Произошла ошибка при поиске устройств:', error);
-        }
-    })();
-} 
