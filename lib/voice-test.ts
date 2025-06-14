@@ -24,9 +24,6 @@ class Voice{
     private devices: any[];
     private wakeWord: string;
     private silenceThreshold: number;
-    private isListening: boolean;
-    private commandBuffer: string[];
-    private lastSpeechTime: number;
     
     constructor(
         apikey: string, 
@@ -38,7 +35,7 @@ class Voice{
         defaultOutputDevice?: any,
         devices?: any[],
         wakeWord: string = 'алиса',
-        silenceThreshold: number = 1500
+        silenceThreshold: number = 2000
     ) {
         this.apikey = apikey;
         this.model = model;
@@ -51,9 +48,6 @@ class Voice{
         this.devices = devices || [];
         this.wakeWord = wakeWord.toLowerCase();
         this.silenceThreshold = silenceThreshold;
-        this.isListening = false;
-        this.commandBuffer = [];
-        this.lastSpeechTime = Date.now();
         
         // Автоматически проверяем модель при создании экземпляра
         this.device();
@@ -67,19 +61,16 @@ class Voice{
         const { defaultInputDevice, defaultOutputDevice } = manager.findDefaultDevices();
         const devices = manager.getDevices();
         
-        // Сохраняем полученные устройства
         this.defaultInputDevice = defaultInputDevice;
         this.defaultOutputDevice = defaultOutputDevice;
         this.devices = devices;
 
-        console.log(this.defaultInputDevice.name);
-        console.log(this.defaultOutputDevice.name);
+        console.log('Найдены устройства:');
+        console.log('Микрофон:', this.defaultInputDevice?.name || 'не найден');
+        console.log('Динамики:', this.defaultOutputDevice?.name || 'не найдены');
     }
 
-
     public async modelSTT(): Promise<void> {
-
-        
         if (fs.existsSync(path.resolve(__dirname, './models', DEFAULT_MODEL_STT))) {
             console.log(`✅ Модель ${DEFAULT_MODEL_STT} найдена.`);
             return;
@@ -88,7 +79,6 @@ class Voice{
         const modelUrl = 'https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip';
         const zipPath = path.resolve(__dirname, './models/vosk-model.zip');
         
-        // Удаляем старый zip-файл, если он существует
         if (fs.existsSync(zipPath)) {
             console.log('🗑️ Удаляю старый zip-файл модели...');
             fs.unlinkSync(zipPath);
@@ -139,7 +129,6 @@ class Voice{
             
             console.log(`📂 Распаковка ${zipEntries.length} файлов...`);
             
-            // Создаем директорию models, если она не существует
             const modelsDir = path.resolve(__dirname, './models');
             if (!fs.existsSync(modelsDir)) {
                 fs.mkdirSync(modelsDir, { recursive: true });
@@ -154,14 +143,12 @@ class Voice{
             console.log('✅ Базовая модель успешно установлена.');
         } catch (err) {
             console.error('❌ Ошибка при установке модели:', err);
-            // Удаляем поврежденный zip-файл
             if (fs.existsSync(zipPath)) {
                 fs.unlinkSync(zipPath);
                 console.log('🗑️ Поврежденный zip-файл удален.');
             }
             throw err;
         } finally {
-            // Удаляем zip-файл только если установка прошла успешно
             if (fs.existsSync(MODEL_PATH) && fs.existsSync(zipPath)) {
                 fs.unlinkSync(zipPath);
                 console.log('🗑️ Временный zip-файл удален.');
@@ -169,28 +156,49 @@ class Voice{
         }
     }
 
-    public async ask(): Promise<void> {
+    public async ask(command: string, maxIterations: number = 3): Promise<string> {
+        try {
+            await ensureOpenRouterApiKey();
+            
+            const options: any = {};
+            if (this.model) options.model = this.model;
+            if (this.temperature) options.temperature = this.temperature;
+            if (this.max_tokens) options.max_tokens = this.max_tokens;
+            
+            const ask = new AskHasyx(
+                this.apikey,
+                { command },
+                options
+            );
 
-        
-        await ensureOpenRouterApiKey();
-        
-        // Создаем объект с опциями, включая только те параметры, которые были переданы
-        const options: any = {};
-        if (this.model) options.model = this.model;
-        if (this.temperature) options.temperature = this.temperature;
-        if (this.max_tokens) options.max_tokens = this.max_tokens;
-        
-        const ask = new AskHasyx(
-            this.apikey,
-            {}, // context
-            options,
-            this.system_prompt
-        );
-        await ask.repl();
+            console.log('\n🤖 Отправляю запрос к нейросети...');
+            let response = await ask.ask(command);
+            console.log('✅ Получен ответ от нейросети');
+            
+            // Проверяем, нужно ли продолжить размышление
+            let iteration = 1;
+            while (iteration < maxIterations) {
+                const shouldContinue = response.includes('🧠 AI думает...') || 
+                                    response.includes('🔄 Итерация') ||
+                                    response.includes('💭 Завершено');
+                
+                if (!shouldContinue) break;
+                
+                console.log(`\n🔄 Продолжаю размышление (итерация ${iteration + 1}/${maxIterations})...`);
+                const nextResponse = await ask.ask(command);
+                response = nextResponse;
+                iteration++;
+            }
+            
+            return response;
+        } catch (error) {
+            console.error('❌ Ошибка при обращении к нейросети:', error);
+            return 'Произошла ошибка при обращении к нейросети';
+        }
     }
 
-    public async transcribe_model(): Promise<void> {
-        console.log('🎤 Начинаю транскрибацию...');
+    public async transcribe(onCommand: (command: string) => Promise<void>): Promise<void> {
+        console.log('🎤 Начинаю работу голосового ассистента...');
         console.log(`🔑 Ключевое слово: "${this.wakeWord}"`);
     
         if (!fs.existsSync(MODEL_PATH)) {
@@ -228,15 +236,32 @@ class Voice{
             '-t', 'raw'
         ]);
 
-        const checkSilence = () => {
-            const now = Date.now();
-            if (this.isListening && (now - this.lastSpeechTime) > this.silenceThreshold) {
-                if (this.commandBuffer.length > 0) {
-                    console.log('\n📝 Полная команда:', this.commandBuffer.join(' '));
-                    this.commandBuffer = [];
+        let lastPartialResult = '';
+        let commandBuffer: string[] = [];
+        let isListening = false;
+        let lastSpeechTime = Date.now();
+        let isProcessing = false;
+
+        const checkSilence = async () => {
+            if (isListening && !isProcessing && (Date.now() - lastSpeechTime) > this.silenceThreshold) {
+                if (commandBuffer.length > 0) {
+                    const fullCommand = commandBuffer.join(' ');
+                    console.log('\n📝 Полная команда:', fullCommand);
+                    
+                    // Сброс до отправки
+                    commandBuffer = [];
+                    isListening = false;
+                    isProcessing = true;
+                    
+                    try {
+                        await onCommand(fullCommand);
+                    } catch (error) {
+                        console.error('❌ Ошибка при обработке команды:', error);
+                    }
+                    
+                    isProcessing = false;
+                    console.log('\n👂 Ожидание ключевого слова...');
                 }
-                this.isListening = false;
-                process.stdout.write('\n👂 Ожидание ключевого слова... ');
             }
         };
 
@@ -247,35 +272,31 @@ class Voice{
                 const result = recognizer.result();
                 if (result.text) {
                     const text = result.text.toLowerCase();
-                    this.lastSpeechTime = Date.now();
+                    lastSpeechTime = Date.now();
 
-                    if (!this.isListening && text.includes(this.wakeWord)) {
-                        this.isListening = true;
-                        console.log('\n🎯 Ключевое слово обнаружено! Слушаю команду...');
+                    if (!isListening && text.includes(this.wakeWord)) {
+                        isListening = true;
+                        console.log(`\n🎯 Ключевое слово обнаружено! Слушаю команду...`);
+                        commandBuffer.push(result.text);
+                        console.log(`🎤 Команда: ${result.text}`);
+                        lastPartialResult = '';
                         return;
                     }
 
-                    if (this.isListening) {
-                        this.commandBuffer.push(result.text);
-                        process.stdout.clearLine(0);
-                        process.stdout.cursorTo(0);
-                        process.stdout.write(`🎤 Команда: ${this.commandBuffer.join(' ')}`);
-                    } else {
-                        process.stdout.clearLine(0);
-                        process.stdout.cursorTo(0);
-                        process.stdout.write(`👂 Ожидание ключевого слова... ${text}`);
+                    if (isListening) {
+                        const lastBuffer = commandBuffer[commandBuffer.length - 1] || '';
+                        if (!lastBuffer.includes(text) && !text.includes(lastBuffer)) {
+                            commandBuffer.push(result.text);
+                            console.log(`🎤 Команда: ${result.text}`);
+                        }
+                        lastPartialResult = '';
                     }
                 }
             } else {
                 const partialResult = recognizer.partialResult();
-                if (partialResult.partial) {
-                    process.stdout.clearLine(0);
-                    process.stdout.cursorTo(0);
-                    if (this.isListening) {
-                        process.stdout.write(`🎤 Команда: ${this.commandBuffer.join(' ')} ${partialResult.partial}`);
-                    } else {
-                        process.stdout.write(`👂 Ожидание ключевого слова... ${partialResult.partial}`);
-                    }
+                if (partialResult.partial && isListening && partialResult.partial !== lastPartialResult) {
+                    console.log(`🎤 Команда: ${partialResult.partial}`);
+                    lastPartialResult = partialResult.partial;
                 }
             }
         });
@@ -309,7 +330,7 @@ class Voice{
     }
 }
 
-// Пример использования с минимальными параметрами
+// Пример использования
 const voice = new Voice(
     process.env.OPENROUTER_API_KEY!,
     undefined,
@@ -320,7 +341,12 @@ const voice = new Voice(
     undefined,
     undefined,
     'алиса', // ключевое слово
-    1500    // порог тишины в миллисекундах
+    2000    // порог тишины в миллисекундах
 );
 
-voice.transcribe_model();
+// Запуск голосового ассистента с обработкой команд через ИИ
+voice.transcribe(async (command) => {
+    const response = await voice.ask(command, 3); // Максимум 3 итерации
+    console.log('\n🤖 Ответ нейросети:');
+    console.log(response);
+});
