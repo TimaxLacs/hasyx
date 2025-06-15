@@ -49,9 +49,25 @@ class Voice{
         this.wakeWord = wakeWord.toLowerCase();
         this.silenceThreshold = silenceThreshold;
         
-        // Автоматически проверяем модель при создании экземпляра
-        this.device();
-        this.modelSTT();
+        // Автоматически запускаем все необходимые функции
+        this.initialize();
+    }
+
+    private async initialize(): Promise<void> {
+        try {
+            // Инициализация устройств
+            await this.device();
+            
+            // Проверка и загрузка модели
+            await this.modelSTT();
+            
+            // Запуск голосового ассистента
+            await this.transcribe();
+
+            // await this.ask('выведи мне точный курс доллара на сегодня');
+        } catch (error) {
+            console.error('❌ Ошибка при инициализации:', error);
+        }
     }
 
     public async device(): Promise<void> {
@@ -156,11 +172,13 @@ class Voice{
         }
     }
 
-    public async ask(command: string, maxIterations: number = 3): Promise<string> {
+    public async ask(command: string): Promise<string> {
         try {
             await ensureOpenRouterApiKey();
             
-            const options: any = {};
+            const options: any = {
+                stream: true // Включаем режим стриминга
+            };
             if (this.model) options.model = this.model;
             if (this.temperature) options.temperature = this.temperature;
             if (this.max_tokens) options.max_tokens = this.max_tokens;
@@ -172,32 +190,33 @@ class Voice{
             );
 
             console.log('\n🤖 Отправляю запрос к нейросети...');
-            let response = await ask.ask(command);
-            console.log('✅ Получен ответ от нейросети');
             
-            // Проверяем, нужно ли продолжить размышление
-            let iteration = 1;
-            while (iteration < maxIterations) {
-                const shouldContinue = response.includes('🧠 AI думает...') || 
-                                    response.includes('🔄 Итерация') ||
-                                    response.includes('💭 Завершено');
-                
-                if (!shouldContinue) break;
-                
-                console.log(`\n🔄 Продолжаю размышление (итерация ${iteration + 1}/${maxIterations})...`);
-                const nextResponse = await ask.ask(command);
-                response = nextResponse;
-                iteration++;
-            }
+            let fullResponse = '';
+            const stream = await ask.askStream(command);
             
-            return response;
+            return new Promise((resolve, reject) => {
+                stream.subscribe({
+                    next: (chunk: string) => {
+                        process.stdout.write(chunk);
+                        fullResponse += chunk;
+                    },
+                    error: (error: any) => {
+                        console.error('\n❌ Ошибка при получении ответа:', error);
+                        reject(error);
+                    },
+                    complete: () => {
+                        console.log('\n✅ Ответ нейросети получен');
+                        resolve(fullResponse);
+                    }
+                });
+            });
         } catch (error) {
             console.error('❌ Ошибка при обращении к нейросети:', error);
             return 'Произошла ошибка при обращении к нейросети';
         }
     }
 
-    public async transcribe(onCommand: (command: string) => Promise<void>): Promise<void> {
+    public async transcribe(): Promise<void> {
         console.log('🎤 Начинаю работу голосового ассистента...');
         console.log(`🔑 Ключевое слово: "${this.wakeWord}"`);
     
@@ -254,7 +273,7 @@ class Voice{
                     isProcessing = true;
                     
                     try {
-                        await onCommand(fullCommand);
+                        await this.ask(fullCommand);
                     } catch (error) {
                         console.error('❌ Ошибка при обработке команды:', error);
                     }
@@ -330,7 +349,7 @@ class Voice{
     }
 }
 
-// Пример использования
+// Пример использования - теперь достаточно просто создать экземпляр
 const voice = new Voice(
     process.env.OPENROUTER_API_KEY!,
     undefined,
@@ -343,10 +362,3 @@ const voice = new Voice(
     'алиса', // ключевое слово
     2000    // порог тишины в миллисекундах
 );
-
-// Запуск голосового ассистента с обработкой команд через ИИ
-voice.transcribe(async (command) => {
-    const response = await voice.ask(command, 3); // Максимум 3 итерации
-    console.log('\n🤖 Ответ нейросети:');
-    console.log(response);
-});
