@@ -48,6 +48,8 @@ class AudioDeviceManager {
     private currentOutputDevice: AudioDevice | null;
     private devices: AudioDevice[];
     private isLinux: boolean;
+    private isWindows: boolean;
+    private isMacOS: boolean;
 
     constructor() {
         this.rtAudio = new RtAudio();
@@ -55,6 +57,8 @@ class AudioDeviceManager {
         this.currentOutputDevice = null;
         this.devices = [];
         this.isLinux = process.platform === 'linux';
+        this.isWindows = process.platform === 'win32';
+        this.isMacOS = process.platform === 'darwin';
     }
 
     private convertRtAudioDeviceToAudioDevice(device: RtAudioDeviceInfo): AudioDevice {
@@ -285,6 +289,162 @@ class AudioDeviceManager {
             const inputDevices = devices.filter(d => d.inputChannels > 0);
             const outputDevices = devices.filter(d => d.outputChannels > 0);
         }, 500);
+    }
+
+    /**
+     * Получает команду для записи аудио с конкретного устройства
+     */
+    getRecordCommand(device: AudioDevice | null, sampleRate: number = 16000): string[] {
+        if (this.isLinux) {
+            if (!device) {
+                // Fallback к лучшему доступному устройству
+                return ['arecord', '-D', 'default', '-f', 'S16_LE', '-r', String(sampleRate), '-c', '1', '-t', 'raw'];
+            }
+            
+            const deviceName = this.getLinuxDeviceName(device);
+            
+            // Добавляем verbose информацию для отладки
+            console.log(`🔍 Маппинг устройства: ${device.name} (RtAudio ID: ${device.id}) -> ALSA: ${deviceName}`);
+            
+            return ['arecord', '-D', deviceName, '-f', 'S16_LE', '-r', String(sampleRate), '-c', '1', '-t', 'raw'];
+        }
+        
+        // Для Windows/macOS будем использовать RtAudio через Node.js
+        throw new Error('getRecordCommand для Windows/macOS должен использовать RtAudio напрямую');
+    }
+
+    /**
+     * Преобразует AudioDevice в имя устройства для Linux
+     */
+    private getLinuxDeviceName(device: AudioDevice): string {
+        // Для Bluetooth устройств
+        if (device.name.includes('bluetooth') || device.name.includes('Bluetooth')) {
+            return 'plug:bluez_sink.monitor';
+        }
+        
+        // Для Linux нужно использовать PulseAudio или правильный ALSA маппинг
+        // RtAudio ID не соответствуют ALSA card ID
+        if (device.name.includes('DMIC')) {
+            // Для встроенного цифрового микрофона используем plughw для автоконвертации
+            return 'plughw:0,6';
+        } else if (device.name.includes('HDA Analog') || device.name.includes('Analog')) {
+            // Для аналогового входа используем устройство 0
+            return 'plughw:0,0';
+        }
+        
+        // Fallback: попробуем использовать PulseAudio напрямую
+        return 'default';
+    }
+
+    /**
+     * Получает лучшее доступное входное устройство
+     */
+    async getBestInputDevice(): Promise<AudioDevice | null> {
+        // Обновляем список устройств
+        const devices = this.getDevices();
+        const { defaultInputDevice } = this.findDefaultDevices();
+        return defaultInputDevice;
+    }
+
+    /**
+     * Отслеживает изменения в устройствах (для Bluetooth и USB)
+     */
+    async refreshDevices(): Promise<{ defaultInputDevice: AudioDevice | null, defaultOutputDevice: AudioDevice | null }> {
+        if (this.isLinux) {
+            // В Linux можем использовать pactl для обновления
+            try {
+                await this.refreshLinuxDevices();
+            } catch (error) {
+                console.warn('Не удалось обновить устройства через pactl:', error);
+            }
+        }
+        
+        // Обновляем через RtAudio
+        const rtDevices = this.rtAudio.getDevices();
+        this.devices = rtDevices.map((device: any) => this.convertRtAudioDeviceToAudioDevice(device));
+        
+        return this.findDefaultDevices();
+    }
+
+    /**
+     * Обновляет устройства в Linux через PulseAudio
+     */
+    private async refreshLinuxDevices(): Promise<void> {
+        try {
+            const { stdout } = await execAsync('pactl list sources short');
+            // Здесь можно добавить логику парсинга PulseAudio устройств
+            console.log('Обновлены устройства PulseAudio');
+        } catch (error) {
+            console.warn('Ошибка при обновлении PulseAudio устройств:', error);
+        }
+    }
+
+    /**
+     * Кроссплатформенная запись аудио для Windows/macOS
+     */
+    async recordAudioStream(device: AudioDevice, sampleRate: number = 16000, channels: number = 1): Promise<NodeJS.ReadableStream> {
+        if (this.isLinux) {
+            throw new Error('Используйте getRecordCommand() для Linux');
+        }
+
+        return new Promise((resolve, reject) => {
+            if (!device) {
+                return reject(new Error("Устройство для записи не предоставлено."));
+            }
+
+            if (device.inputChannels < channels) {
+                return reject(new Error(`Устройство не поддерживает ${channels} канал(а) для записи.`));
+            }
+
+            try {
+                const { PassThrough } = require('stream');
+                const audioStream = new PassThrough();
+
+                this.rtAudio.openStream(
+                    null, // No output
+                    {
+                        deviceId: device.id,
+                        nChannels: channels,
+                        firstChannel: 0,
+                    },
+                    16, // 16-bit
+                    sampleRate,
+                    1024, // frames per buffer
+                    'voice-input-stream',
+                    (inputBuffer: Buffer) => {
+                        audioStream.write(inputBuffer);
+                    },
+                    null,
+                    undefined
+                );
+
+                this.rtAudio.start();
+                resolve(audioStream);
+
+            } catch (error: unknown) {
+                if (this.rtAudio.isStreamOpen()) {
+                    this.rtAudio.closeStream();
+                }
+                reject(error);
+            }
+        });
+    }
+
+    /**
+     * Останавливает запись аудио для Windows/macOS
+     */
+    stopAudioStream(): void {
+        if (this.rtAudio.isStreamOpen()) {
+            this.rtAudio.stop();
+            this.rtAudio.closeStream();
+        }
+    }
+
+    /**
+     * Проверяет, является ли платформа кроссплатформенной (не Linux)
+     */
+    requiresRtAudio(): boolean {
+        return this.isWindows || this.isMacOS;
     }
 }
 

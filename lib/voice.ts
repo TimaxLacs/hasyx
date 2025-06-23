@@ -1,275 +1,523 @@
-// Импорты
 import AudioDeviceManager from './voice-device';
+import { AskHasyx, ensureOpenRouterApiKey } from 'hasyx/lib/ask-hasyx';
+import AdmZip from 'adm-zip';
+import path from 'path';
 // @ts-ignore
 import * as vosk from 'vosk';
 import * as fs from 'fs';
-import { Readable } from 'stream';
-// @ts-ignore
-import * as wav from 'wav';
-import { spawn } from 'child_process';
-import * as os from 'os';
 import * as https from 'https';
-import AdmZip from 'adm-zip';
-import path from 'path';
+import { spawn } from 'child_process';
 
-// --- НАСТРОЙКИ --- //
-const MODEL_PATH = 'vosk-model-small-ru-0.22';
+const DEFAULT_MODEL_STT = 'vosk-model-small-ru-0.22';
+const MODEL_PATH = path.resolve(__dirname, './models', DEFAULT_MODEL_STT);
 const SAMPLE_RATE = 16000;
-const DEBUG_FILE = 'debug_audio.wav';
-const SILENCE_THRESHOLD = 500; // Порог тишины (0-32767)
-const CONTEXT_BUFFER_SIZE = SAMPLE_RATE * 5; // 5 секунд контекста
-const PROCESSING_BUFFER_SIZE = SAMPLE_RATE * 0.5 * 2; // 0.5 секунды для обработки
-
-// Состояния программы
-enum State {
-    LISTENING,    // Ожидание команды активации
-    PROCESSING    // Обработка команды после активации
-}
 
 /**
- * Функция для тестирования аудио устройств.
- * Обнаруживает все доступные устройства и выводит информацию о них в консоль.
+ * Голосовой ассистент с поддержкой кроссплатформенного распознавания речи
+ * 
+ * Особенности:
+ * - Автоматический выбор лучшего доступного микрофона (Bluetooth, USB, встроенный)
+ * - Кроссплатформенная поддержка (Linux: ALSA/PulseAudio, Windows/macOS: RtAudio)
+ * - Динамическое отслеживание подключения новых устройств
+ * - Умная система приоритетов устройств (headset +50, Bluetooth +20, USB +20)
  */
-async function testAudioDevices() {
-    console.log('=== Анализ аудио устройств системы ===');
+class Voice{
+    private apikey: string;
+    private model?: string;
+    private temperature?: number;
+    private max_tokens?: number;
+    private system_prompt?: string;
+    private output_handlers: any;
+    private defaultInputDevice: any;
+    private defaultOutputDevice: any;
+    private devices: any[];
+    private wakeWord: string;
+    private silenceThreshold: number;
     
-    try {
+    constructor(
+        apikey: string, 
+        model?: string, 
+        temperature?: number, 
+        max_tokens?: number, 
+        system_prompt?: string,
+        defaultInputDevice?: any,
+        defaultOutputDevice?: any,
+        devices?: any[],
+        wakeWord: string = 'алиса',
+        silenceThreshold: number = 2000
+    ) {
+        this.apikey = apikey;
+        this.model = model;
+        this.temperature = temperature;
+        this.max_tokens = max_tokens;
+        this.system_prompt = system_prompt || `Ты - голосовой ассистент. Твои ответы должны быть краткими и понятными для прослушивания. 
+        Если тебе нужно выделить важную информацию, используй формат: <VOICE>ТЕКСТ_ДЛЯ_ОЗВУЧКИ</VOICE>
+        Весь остальной текст будет проигнорирован при озвучке. 
+        Старайся давать четкие и лаконичные ответы, которые удобно воспринимать на слух.`;
+        this.output_handlers = {};
+        this.defaultInputDevice = defaultInputDevice;
+        this.defaultOutputDevice = defaultOutputDevice;
+        this.devices = devices || [];
+        this.wakeWord = wakeWord.toLowerCase();
+        this.silenceThreshold = silenceThreshold;
+        
+        // Автоматически запускаем все необходимые функции
+        this.initialize();
+    }
+
+    private async initialize(): Promise<void> {
+        try {
+            // Инициализация устройств
+            await this.device();
+            
+            // Проверка и загрузка модели
+            await this.modelSTT();
+            
+            // Запуск голосового ассистента
+            await this.transcribe();
+
+            // await this.ask('выведи мне точный курс доллара на сегодня');
+        } catch (error) {
+            console.error('❌ Ошибка при инициализации:', error);
+        }
+    }
+
+    public async device(): Promise<void> {
         const manager = new AudioDeviceManager();
         await manager.initialize();
         
         const { defaultInputDevice, defaultOutputDevice } = manager.findDefaultDevices();
         const devices = manager.getDevices();
         
-        console.log('\n=== Устройства по умолчанию ===');
-        
-        if (defaultInputDevice) {
-            console.log('\nМикрофон по умолчанию:');
-            console.log(`  ID: ${defaultInputDevice.id}`);
-            console.log(`  Название: ${defaultInputDevice.name}`);
-            console.log(`  Каналов: ${defaultInputDevice.inputChannels}`);
-            console.log(defaultOutputDevice);
-        } else {
-            console.log('\nМикрофон по умолчанию не найден');
-        }
-        
-        if (defaultOutputDevice) {
-            console.log('\nДинамик по умолчанию:');
-            console.log(`  ID: ${defaultOutputDevice.id}`);
-            console.log(`  Название: ${defaultOutputDevice.name}`);
-            console.log(`  Каналов: ${defaultOutputDevice.outputChannels}`);
-        } else {
-            console.log('\nДинамик по умолчанию не найден');
-        }
-        
-        console.log('\n=== Завершение анализа аудио устройств ===');
-    } catch (error) {
-        console.error('Произошла ошибка при анализе аудио устройств:', error);
-    }
-}
-testAudioDevices();
-/**
- * Функция для загрузки и распаковки модели
- */
-async function ensureModelExists() {
-    if (fs.existsSync(MODEL_PATH)) {
-        console.log('✅ Модель Vosk уже существует.');
-        return;
+        this.defaultInputDevice = defaultInputDevice;
+        this.defaultOutputDevice = defaultOutputDevice;
+        this.devices = devices;
+
+        console.log('Найдены устройства:');
+        console.log('Микрофон:', this.defaultInputDevice?.name || 'не найден');
+        console.log('Динамики:', this.defaultOutputDevice?.name || 'не найдены');
     }
 
-    console.log('⏳ Модель не найдена. Начинаю загрузку...');
-    const modelUrl = 'https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip';
-    const zipPath = path.resolve(__dirname, '../vosk-model.zip');
-    
-    await new Promise<void>((resolve, reject) => {
-        const file = fs.createWriteStream(zipPath);
-        https.get(modelUrl, (response) => {
-            response.pipe(file);
-            file.on('finish', () => {
-                file.close();
-                console.log('✅ Загрузка модели завершена.');
-                resolve();
+    public async modelSTT(): Promise<void> {
+        if (fs.existsSync(path.resolve(__dirname, './models', DEFAULT_MODEL_STT))) {
+            console.log(`✅ Модель ${DEFAULT_MODEL_STT} найдена.`);
+            return;
+        }
+
+        const modelUrl = 'https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip';
+        const zipPath = path.resolve(__dirname, './models/vosk-model.zip');
+        
+        if (fs.existsSync(zipPath)) {
+            console.log('🗑️ Удаляю старый zip-файл модели...');
+            fs.unlinkSync(zipPath);
+        }
+
+        console.log('⏳ Начинаю загрузку модели...');
+        console.log(`📥 Загрузка модели с ${modelUrl}`);
+        
+        await new Promise<void>((resolve, reject) => {
+            const file = fs.createWriteStream(zipPath);
+            let downloadedBytes = 0;
+            let totalBytes = 0;
+
+            https.get(modelUrl, (response) => {
+                totalBytes = parseInt(response.headers['content-length'] || '0', 10);
+                console.log(`📦 Общий размер файла: ${(totalBytes / 1024 / 1024).toFixed(2)}MB`);
+                
+                response.on('data', (chunk) => {
+                    downloadedBytes += chunk.length;
+                    const progress = (downloadedBytes / totalBytes * 100).toFixed(2);
+                    process.stdout.write(`\r📥 Загрузка: ${progress}% (${(downloadedBytes / 1024 / 1024).toFixed(2)}MB)`);
+                });
+
+                response.on('end', () => {
+                    process.stdout.write('\n');
+                    file.end();
+                });
+
+                response.pipe(file);
+                
+                file.on('finish', () => {
+                    file.close();
+                    console.log('✅ Загрузка модели завершена.');
+                    resolve();
+                });
+            }).on('error', (err) => {
+                fs.unlink(zipPath, () => {});
+                console.error('❌ Ошибка при загрузке модели:', err);
+                reject(err);
             });
-        }).on('error', (err) => {
-            fs.unlink(zipPath, () => {});
-            console.error('❌ Ошибка при загрузке модели:', err);
-            reject(err);
         });
-    });
-
-    try {
-        console.log(' unpacking model...');
-        const zip = new AdmZip(zipPath);
-        const zipEntries = zip.getEntries();
-        const rootDir = zipEntries[0].entryName.split('/')[0];
-        
-        zip.extractAllTo(path.resolve(__dirname, '../'), true);
-        fs.renameSync(path.resolve(__dirname, '../', rootDir), path.resolve(__dirname, '../', MODEL_PATH));
-        
-        console.log('✅ Модель успешно распакована.');
-    } catch (err) {
-        console.error('❌ Ошибка при распаковке модели:', err);
-    } finally {
-        fs.unlinkSync(zipPath);
-        console.log('🗑️ Временный zip-файл удален.');
-    }
-}
-
-/**
- * Основная функция программы
- */
-async function main() {
-    await ensureModelExists();
-
-    const model = new vosk.Model(MODEL_PATH);
-    const recognizer = new vosk.Recognizer({ model: model, sampleRate: SAMPLE_RATE });
     
-    const fileWriter = new wav.Writer({
-        channels: 1,
-        sampleRate: SAMPLE_RATE,
-        bitDepth: 16
-    });
-    const fileStream = fs.createWriteStream(DEBUG_FILE);
-    fileWriter.pipe(fileStream);
-
-    // Инициализируем менеджер аудио устройств
-    const audioManager = new AudioDeviceManager();
-    await audioManager.initialize();
-    const { defaultInputDevice } = audioManager.findDefaultDevices();
-
-    if (!defaultInputDevice) {
-        throw new Error('Не найдено устройство ввода по умолчанию');
-    }
-
-    console.log(`Используется устройство ввода: ${defaultInputDevice.name} (ID: ${defaultInputDevice.id})`);
-
-    const arecord = spawn('arecord', [
-        '-D', 'plug:default',
-        '-f', 'S16_LE',
-        '-c', '1', // моно
-        '-r', SAMPLE_RATE.toString(),
-        '-t', 'raw'
-    ]);
-
-    let currentState = State.LISTENING;
-    let contextBuffer: Buffer[] = [];
-    let processingBuffer: Buffer[] = [];
-    let lastCommandTime = Date.now();
-    let isCommandActive = false;
-
-    function isSilence(audioData: Buffer): boolean {
-        let sum = 0;
-        for (let i = 0; i < audioData.length; i += 2) {
-            sum += Math.abs(audioData.readInt16LE(i));
-        }
-        return (sum / (audioData.length / 2)) < SILENCE_THRESHOLD;
-    }
-
-    function updateContextBuffer(data: Buffer) {
-        contextBuffer.push(data);
-        let totalSize = contextBuffer.reduce((acc, buf) => acc + buf.length, 0);
-        
-        while (totalSize > CONTEXT_BUFFER_SIZE) {
-            const oldestBuffer = contextBuffer.shift();
-            if (oldestBuffer) {
-                totalSize -= oldestBuffer.length;
-            }
-        }
-    }
-
-    function getLastAudioData(seconds: number): Buffer {
-        const targetSize = SAMPLE_RATE * seconds * 2;
-        let result: Buffer[] = [];
-        let totalSize = 0;
-        
-        for (let i = contextBuffer.length - 1; i >= 0; i--) {
-            const buffer = contextBuffer[i];
-            result.unshift(buffer);
-            totalSize += buffer.length;
-            if (totalSize >= targetSize) break;
-        }
-        
-        return Buffer.concat(result);
-    }
-
-    function processCommand(audioData: Buffer) {
-        if (recognizer.acceptWaveform(audioData)) {
-            const result = recognizer.result();
-            if (result.text && result.text.toLowerCase().includes('алиса')) {
-                console.log('🎯 Обнаружена команда активации!');
-                console.log('Распознано:', result.text);
-
-                isCommandActive = true;
-                lastCommandTime = Date.now();
-                currentState = State.PROCESSING;
-            }
-        }
-    }
-
-    function updateStatus() {
-        const status = currentState === State.LISTENING ? '👂 Ожидание команды' : '🎤 Обработка команды';
-        const timeSinceLastCommand = Math.floor((Date.now() - lastCommandTime) / 1000);
-        process.stdout.write(`\r${status} (${timeSinceLastCommand}с) `);
-    }
-
-    function cleanup() {
         try {
-            arecord.kill();
-            fileWriter.end();
+            console.log('📦 Начинаю распаковку модели...');
+            const zip = new AdmZip(zipPath);
+            const zipEntries = zip.getEntries();
+            const rootDir = zipEntries[0].entryName.split('/')[0];
+            
+            console.log(`📂 Распаковка ${zipEntries.length} файлов...`);
+            
+            const modelsDir = path.resolve(__dirname, './models');
+            if (!fs.existsSync(modelsDir)) {
+                fs.mkdirSync(modelsDir, { recursive: true });
+            }
+            
+            zip.extractAllTo(modelsDir, true);
+            console.log(`📂 Распаковка завершена: ${zipEntries.length} файлов`);
+            
+            console.log('📦 Перемещение распакованных файлов...');
+            fs.renameSync(path.resolve(modelsDir, rootDir), MODEL_PATH);
+            
+            console.log('✅ Базовая модель успешно установлена.');
+        } catch (err) {
+            console.error('❌ Ошибка при установке модели:', err);
+            if (fs.existsSync(zipPath)) {
+                fs.unlinkSync(zipPath);
+                console.log('🗑️ Поврежденный zip-файл удален.');
+            }
+            throw err;
+        } finally {
+            if (fs.existsSync(MODEL_PATH) && fs.existsSync(zipPath)) {
+                fs.unlinkSync(zipPath);
+                console.log('🗑️ Временный zip-файл удален.');
+            }
+        }
+    }
+
+    public async ask(command: string): Promise<string> {
+        try {
+            await ensureOpenRouterApiKey();
+            
+            const options: any = {
+                stream: true,
+                system_prompt: this.system_prompt
+            };
+            if (this.model) options.model = this.model;
+            if (this.temperature) options.temperature = this.temperature;
+            if (this.max_tokens) options.max_tokens = this.max_tokens;
+            
+            console.log('\n🔧 Настройки запроса:');
+            console.log('📋 Системный промпт:', this.system_prompt);
+            console.log('⚙️ Опции:', options);
+            
+            const ask = new AskHasyx(
+                this.apikey,
+                { command },
+                options,
+                this.system_prompt
+            );
+
+            console.log('\n🤖 Отправляю запрос к нейросети...');
+            
+            let fullResponse = '';
+            let currentVoiceText = '';
+            let isInsideVoiceTag = false;
+            const stream = await ask.askStream(command);
+            
+            // Функция для разбиения текста на предложения
+            const splitIntoSentences = (text: string): string[] => {
+                return text.split(/(?<=[.!?])\s+/).filter(s => s.trim().length > 0);
+            };
+
+            // Функция для обработки накопленного текста
+            const processAccumulatedText = async (text: string) => {
+                const sentences = splitIntoSentences(text);
+                for (const sentence of sentences) {
+                    if (sentence.trim()) {
+                        await this.TTS(sentence.trim());
+                    }
+                }
+            };
+            
+            return new Promise((resolve, reject) => {
+                stream.subscribe({
+                    next: async (chunk: string) => {
+                        process.stdout.write(chunk);
+                        fullResponse += chunk;
+                        
+                        // Обрабатываем чанк посимвольно для корректной обработки тегов
+                        for (let i = 0; i < chunk.length; i++) {
+                            const char = chunk[i];
+                            
+                            // Проверяем начало тега
+                            if (chunk.slice(i, i + 7) === '<VOICE>') {
+                                isInsideVoiceTag = true;
+                                i += 6; // Пропускаем длину тега
+                                continue;
+                            }
+                            
+                            // Проверяем конец тега
+                            if (chunk.slice(i, i + 8) === '</VOICE>') {
+                                isInsideVoiceTag = false;
+                                i += 7; // Пропускаем длину тега
+                                
+                                // Обрабатываем накопленный текст
+                                if (currentVoiceText.trim()) {
+                                    await processAccumulatedText(currentVoiceText);
+                                    currentVoiceText = '';
+                                }
+                                continue;
+                            }
+                            
+                            // Если мы внутри тега, добавляем символ к накопленному тексту
+                            if (isInsideVoiceTag) {
+                                currentVoiceText += char;
+                                
+                                // Проверяем, не закончилось ли предложение
+                                if (['.', '!', '?'].includes(char)) {
+                                    const sentences = splitIntoSentences(currentVoiceText);
+                                    if (sentences.length > 1) {
+                                        // Обрабатываем все предложения кроме последнего
+                                        for (let j = 0; j < sentences.length - 1; j++) {
+                                            await this.TTS(sentences[j].trim());
+                                        }
+                                        // Оставляем последнее предложение в буфере
+                                        currentVoiceText = sentences[sentences.length - 1];
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    error: (error: any) => {
+                        console.error('\n❌ Ошибка при получении ответа:', error);
+                        reject(error);
+                    },
+                    complete: async () => {
+                        // Обрабатываем оставшийся текст при завершении
+                        if (currentVoiceText.trim()) {
+                            await processAccumulatedText(currentVoiceText);
+                        }
+                        console.log('\n✅ Ответ нейросети получен');
+                        resolve(fullResponse);
+                    }
+                });
+            });
+        } catch (error) {
+            console.error('❌ Ошибка при обращении к нейросети:', error);
+            return 'Произошла ошибка при обращении к нейросети';
+        }
+    }
+
+    public async transcribe(): Promise<void> {
+        console.log('🎤 Начинаю работу голосового ассистента...');
+        console.log(`🔑 Ключевое слово: "${this.wakeWord}"`);
+    
+        if (!fs.existsSync(MODEL_PATH)) {
+            console.error(`❌ Модель не найдена по пути: ${MODEL_PATH}`);
+            console.error('Пожалуйста, убедитесь, что модель загружена. Попробую загрузить...');
+            await this.modelSTT();
+            if (!fs.existsSync(MODEL_PATH)) {
+                console.error('❌ Не удалось загрузить модель. Выход.');
+                return;
+            }
+        }
+    
+        vosk.setLogLevel(-1);
+        const model = new vosk.Model(MODEL_PATH);
+        const recognizer = new vosk.Recognizer({ model: model, sampleRate: SAMPLE_RATE });
+    
+        // Создаем AudioDeviceManager для динамического управления устройствами
+        const deviceManager = new AudioDeviceManager();
+        await deviceManager.initialize();
+        
+        // Получаем лучшее доступное устройство
+        const bestInputDevice = await deviceManager.getBestInputDevice();
+        
+        if (!bestInputDevice) {
+            console.error('❌ Не удалось определить устройство ввода. Выход.');
             recognizer.free();
             model.free();
-        } catch (err) {
-            console.error('Ошибка при очистке ресурсов:', err);
+            return;
         }
-    }
-
-    arecord.stdout.on('data', (data: Buffer) => {
-        fileWriter.write(data);
-        updateContextBuffer(data);
-        processingBuffer.push(data);
         
-        const totalSize = processingBuffer.reduce((acc, buf) => acc + buf.length, 0);
-        if (totalSize >= PROCESSING_BUFFER_SIZE) {
-            const audioData = Buffer.concat(processingBuffer);
-            processingBuffer = [];
-            
-            const silence = isSilence(audioData);
-            processCommand(audioData);
-            
-            if (currentState === State.PROCESSING && silence) {
-                const silenceDuration = (Date.now() - lastCommandTime) / 1000;
-                if (silenceDuration > 1) { // Если тишина длится больше 1 секунды
-                    console.log('\n🔍 Команда завершена');
-                    currentState = State.LISTENING;
-                    isCommandActive = false;
+        console.log(`🎧 Использую устройство ввода: ${bestInputDevice.name} (ID: ${bestInputDevice.id})`);
+    
+        // Кроссплатформенная инициализация записи
+        let arecord: any;
+        let audioStream: NodeJS.ReadableStream | null = null;
+        
+        if (deviceManager.requiresRtAudio()) {
+            // Windows/macOS: используем RtAudio напрямую
+            try {
+                console.log('🔧 Использую RtAudio для Windows/macOS');
+                audioStream = await deviceManager.recordAudioStream(bestInputDevice, SAMPLE_RATE, 1);
+                
+                // Создаем псевдо-процесс для совместимости
+                arecord = {
+                    stdout: audioStream,
+                    stderr: { on: () => {} },
+                    on: (event: string, callback: Function) => {
+                        if (event === 'close') {
+                            audioStream?.on('end', () => callback(0));
+                        }
+                    },
+                    kill: () => {
+                        deviceManager.stopAudioStream();
+                        if (audioStream && 'destroy' in audioStream) {
+                            (audioStream as any).destroy();
+                        }
+                    }
+                };
+                
+            } catch (error) {
+                console.error('❌ Ошибка инициализации RtAudio:', error);
+                recognizer.free();
+                model.free();
+                return;
+            }
+        } else {
+            // Linux: используем arecord
+            try {
+                const recordCommand = deviceManager.getRecordCommand(bestInputDevice, SAMPLE_RATE);
+                console.log(`🔧 Команда записи: ${recordCommand.join(' ')}`);
+                arecord = spawn(recordCommand[0], recordCommand.slice(1));
+            } catch (error) {
+                console.warn('⚠️ Ошибка при получении команды записи, использую fallback:', error);
+                const recordCommand = deviceManager.getRecordCommand(bestInputDevice, SAMPLE_RATE);
+                console.log(`🔧 Используется команда записи: ${recordCommand.join(' ')}`);
+                arecord = spawn(recordCommand[0], recordCommand.slice(1));
+            }
+        }
+
+        let lastPartialResult = '';
+        let commandBuffer: string[] = [];
+        let isListening = false;
+        let lastSpeechTime = Date.now();
+        let isProcessing = false;
+        let currentInputDevice = bestInputDevice;
+
+        const checkSilence = async (л) => {
+            if (isListening && !isProcessing && (Date.now() - lastSpeechTime) > this.silenceThreshold) {
+                if (commandBuffer.length > 0) {
+                    const fullCommand = commandBuffer.join(' ');
+                    console.log('\n📝 Полная команда:', fullCommand);
+                    
+                    // Сброс до отправки
+                    commandBuffer = [];
+                    isListening = false;
+                    isProcessing = true;
+                    
+                    try {
+                        await this.ask(fullCommand);
+                    } catch (error) {
+                        console.error('❌ Ошибка при обработке команды:', error);
+                    }
+                    
+                    isProcessing = false;
+                    console.log('\n👂 Ожидание ключевого слова...');
                 }
             }
-            
-            // Обновляем статус
-            updateStatus();
-        }
-    });
+        };
 
-    // Обработка ошибок
-    arecord.stderr.on('data', (data: Buffer) => {
-        console.error('Ошибка записи:', data.toString());
-    });
+        // Проверка на изменения устройств (для Bluetooth)
+        const checkDeviceChanges = async () => {
+            if (!isProcessing) {
+                try {
+                    const newBestDevice = await deviceManager.getBestInputDevice();
+                    if (newBestDevice && newBestDevice.id !== currentInputDevice?.id) {
+                        console.log(`\n🔄 Обнаружено новое лучшее устройство: ${newBestDevice.name}`);
+                        console.log('⚠️ Для переключения устройства потребуется перезапуск...');
+                        currentInputDevice = newBestDevice;
+                    }
+                } catch (error) {
+                    console.warn('⚠️ Ошибка при проверке устройств:', error);
+                }
+            }
+        };
 
-    arecord.on('error', (err: Error) => {
-        console.error('Ошибка процесса:', err);
-        cleanup();
-    });
+        const silenceCheckInterval = setInterval(checkSilence, 100);
+        const deviceCheckInterval = setInterval(checkDeviceChanges, 5000); // Проверяем каждые 5 секунд
+    
+        arecord.stdout.on('data', (data) => {
+            if (recognizer.acceptWaveform(data)) {
+                const result = recognizer.result();
+                if (result.text) {
+                    const text = result.text.toLowerCase();
+                    console.log(`\n🔍 Распознано: "${text}"`);
+                    lastSpeechTime = Date.now();
 
+                    if (!isListening && text.includes(this.wakeWord)) {
+                        isListening = true;
+                        console.log(`\n🎯 Ключевое слово "${this.wakeWord}" обнаружено! Слушаю команду...`);
+                        commandBuffer.push(result.text);
+                        console.log(`🎤 Команда: ${result.text}`);
+                        lastPartialResult = '';
+                        return;
+                    }
 
-    // Обработка сигналов завершения
-    process.on('SIGINT', () => {
-        console.log('\nОстановка записи...');
-        cleanup();
-        process.exit(0);
-    });
+                    if (isListening) {
+                        const lastBuffer = commandBuffer[commandBuffer.length - 1] || '';
+                        if (!lastBuffer.includes(text) && !text.includes(lastBuffer)) {
+                            commandBuffer.push(result.text);
+                            console.log(`🎤 Команда: ${result.text}`);
+                        }
+                        lastPartialResult = '';
+                    }
+                }
+            } else {
+                const partialResult = recognizer.partialResult();
+                if (partialResult.partial) {
+                    // console.log(`\n🔄 Частично распознано: "${partialResult.partial}"`);
+                    if (isListening && partialResult.partial !== lastPartialResult) {
+                        console.log(`🎤 Команда: ${partialResult.partial}`);
+                        lastPartialResult = partialResult.partial;
+                    }
+                }
+            }
+        });
+    
+        arecord.stderr.on('data', (data) => {
+            console.error(`❌ Ошибка arecord: ${data}`);
+        });
+    
+        const cleanup = () => {
+            console.log('\nВыполняю очистку и завершаю работу...');
+            clearInterval(silenceCheckInterval);
+            clearInterval(deviceCheckInterval);
+            arecord.kill();
+            if (deviceManager.requiresRtAudio()) {
+                deviceManager.stopAudioStream();
+            }
+            recognizer.free();
+            model.free();
+        };
+        
+        process.on('SIGINT', () => {
+            cleanup();
+            process.exit(0);
+        });
+        
+        arecord.on('close', (code) => {
+            if (code !== 0 && code !== null) { 
+                 console.log(`arecord процесс завершился с кодом ${code}`);
+            }
+            cleanup();
+        });
+    
+        console.log('✅ Микрофон запущен. Говорите... (Для остановки нажмите Ctrl+C)');
+        console.log('👂 Ожидание ключевого слова...');
+    }
 
-    console.log('Микрофон запущен. Говорите...');
-    console.log(`Отладочный файл записывается в: ${DEBUG_FILE}`);
-    console.log('Для активации скажите "алиса"');
+    public async TTS(text: string): Promise<void> {
+        const startTime = Date.now();
+        console.log(`📝 Текст для озвучки: "${text}"`);        // Здесь будет реальная реализация TTS
+        // Пока просто имитируем задержку синтеза
+        
+        const endTime = Date.now();
+        console.log('✅ Синтез речи завершен');
+    }
 }
 
-main().catch(console.error); 
+// Пример использования - теперь достаточно просто создать экземпляр
+const voice = new Voice(
+    process.env.OPENROUTER_API_KEY!,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    'алиса', // ключевое слово
+    2000    // порог тишины в миллисекундах
+);
