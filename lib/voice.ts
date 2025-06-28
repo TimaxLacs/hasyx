@@ -37,6 +37,11 @@ class Voice{
     private currentAbortController?: AbortController;
     private askInstance?: AskHasyx;
     
+    // Добавляем поля для управления TTS
+    private ttsQueue: Array<{ text: string; abortController: AbortController }> = [];
+    private currentTTS?: { text: string; abortController: AbortController };
+    private isTTSActive: boolean = false;
+    
     constructor(
         apikey?: string, 
         model?: string, 
@@ -117,16 +122,27 @@ class Voice{
     }
 
     private interruptCurrentProcess(): void {
-        if (this.isProcessing) {
-            console.log('🛑 Прерываю текущий процесс...');
-            
-            // Отменяем генерацию ИИ
-            if (this.currentAbortController) {
-                this.currentAbortController.abort();
-            }
-            
-            this.isProcessing = false;
+        console.log('🛑 Прерываю все текущие процессы...');
+        
+        // Отменяем генерацию ИИ
+        if (this.currentAbortController) {
+            this.currentAbortController.abort();
         }
+        
+        // Прерываем текущую TTS
+        if (this.currentTTS) {
+            this.currentTTS.abortController.abort();
+            this.currentTTS = undefined;
+        }
+        
+        // Очищаем очередь TTS
+        if (this.ttsQueue.length > 0) {
+            this.ttsQueue.forEach(tts => tts.abortController.abort());
+            this.ttsQueue = [];
+        }
+        
+        this.isProcessing = false;
+        this.isTTSActive = false;
     }
 
     public async device(): Promise<void> {
@@ -329,8 +345,13 @@ class Voice{
                         }
                     },
                     error: (error: any) => {
-                        console.error('\n❌ Ошибка при получении ответа:', error);
-                        reject(error);
+                        if (error.message && error.message.includes('Прервано пользователем')) {
+                            // Тихо обрабатываем прерывание пользователем
+                            reject(error);
+                        } else {
+                            console.error('\n❌ Ошибка при получении ответа:', error);
+                            reject(error);
+                        }
                     },
                     complete: async () => {
                         // Обрабатываем оставшийся текст при завершении
@@ -452,7 +473,11 @@ class Voice{
                     try {
                         await this.ask(fullCommand);
                     } catch (error) {
-                        console.error('❌ Ошибка при обработке команды:', error);
+                        if (error instanceof Error && error.message.includes('Прервано пользователем')) {
+                            // Тихо обрабатываем прерывание - это нормальное поведение
+                        } else {
+                            console.error('❌ Ошибка при обработке команды:', error);
+                        }
                     }
                     
                     isProcessing = false;
@@ -489,13 +514,24 @@ class Voice{
                     lastSpeechTime = Date.now();
 
                     if (!isListening && text.includes(this.name)) {
-                        // Прерываем текущий процесс при активации
+                        // МГНОВЕННО прерываем все текущие процессы при активации
                         this.interruptCurrentProcess();
                         
                         isListening = true;
                         console.log(`\n🎯 Ключевое слово "${this.name}" обнаружено! Слушаю команду...`);
                         commandBuffer.push(result.text);
                         console.log(`🎤 Команда: ${result.text}`);
+                        lastPartialResult = '';
+                        return;
+                    }
+                    
+                    // Также проверяем прерывание во время слушания команды
+                    if (isListening && text.includes(this.name) && commandBuffer.length > 0) {
+                        // Если во время слушания команды снова услышали имя - начинаем новую команду
+                        console.log(`\n🔄 Новое обращение "${this.name}" во время команды - перезапускаю...`);
+                        this.interruptCurrentProcess();
+                        commandBuffer = [result.text];
+                        console.log(`🎤 Новая команда: ${result.text}`);
                         lastPartialResult = '';
                         return;
                     }
@@ -512,6 +548,17 @@ class Voice{
             } else {
                 const partialResult = recognizer.partialResult();
                 if (partialResult.partial) {
+                    const partialText = partialResult.partial.toLowerCase();
+                    
+                    // Проверяем прерывание даже в частичных результатах для быстрого реагирования
+                    if (partialText.includes(this.name)) {
+                        // Если услышали имя в частичном результате во время обработки - прерываем
+                        if (this.isProcessing || this.isTTSActive) {
+                            console.log(`\n⚡ Быстрое прерывание по частичному результату: "${partialText}"`);
+                            this.interruptCurrentProcess();
+                        }
+                    }
+                    
                     // console.log(`\n🔄 Частично распознано: "${partialResult.partial}"`);
                     if (isListening && partialResult.partial !== lastPartialResult) {
                         console.log(`🎤 Команда: ${partialResult.partial}`);
@@ -554,18 +601,96 @@ class Voice{
     }
 
     public async TTS(text: string): Promise<void> {
-        // Проверяем прерывание перед TTS
-        if (this.currentAbortController?.signal.aborted) {
-            console.log('🛑 TTS прерван');
+        // Создаем AbortController для этой конкретной TTS
+        const ttsAbortController = new AbortController();
+        
+        // Добавляем в очередь
+        const ttsItem = { text, abortController: ttsAbortController };
+        this.ttsQueue.push(ttsItem);
+        
+        // Если TTS не активна, запускаем обработку очереди
+        if (!this.isTTSActive) {
+            await this.processTTSQueue();
+        }
+    }
+    
+    private async processTTSQueue(): Promise<void> {
+        if (this.isTTSActive || this.ttsQueue.length === 0) {
             return;
         }
         
-        const startTime = Date.now();
-        console.log(`📝 Текст для озвучки: "${text}"`);        // Здесь будет реальная реализация TTS
-        // Пока просто имитируем задержку синтеза
+        this.isTTSActive = true;
         
-        const endTime = Date.now();
-        console.log('✅ Синтез речи завершен');
+        while (this.ttsQueue.length > 0) {
+            // Проверяем глобальное прерывание
+            if (this.currentAbortController?.signal.aborted) {
+                console.log('🛑 Обработка TTS прервана глобально');
+                break;
+            }
+            
+            const ttsItem = this.ttsQueue.shift();
+            if (!ttsItem) continue;
+            
+            this.currentTTS = ttsItem;
+            
+            try {
+                await this.executeTTS(ttsItem.text, ttsItem.abortController);
+            } catch (error) {
+                if (error instanceof Error && (error.message.includes('TTS прервана') || error.name === 'AbortError')) {
+                    // Тихо обрабатываем прерывание TTS - это нормальное поведение
+                } else {
+                    console.error('❌ Ошибка TTS:', error);
+                }
+            }
+            
+            this.currentTTS = undefined;
+            
+            // Если была прервана, тихо очищаем оставшуюся очередь
+            if (ttsItem.abortController.signal.aborted) {
+                this.ttsQueue.forEach(item => item.abortController.abort());
+                this.ttsQueue = [];
+                break;
+            }
+        }
+        
+        this.isTTSActive = false;
+    }
+    
+    private async executeTTS(text: string, abortController: AbortController): Promise<void> {
+        return new Promise((resolve, reject) => {
+            // Проверяем прерывание перед началом
+            if (abortController.signal.aborted) {
+                reject(new Error('TTS прервана до начала'));
+                return;
+            }
+            
+            console.log(`📝 Озвучиваю: "${text}"`);
+            
+            // Имитируем TTS с возможностью прерывания
+            const startTime = Date.now();
+            const duration = Math.min(text.length * 50, 3000); // Примерная длительность
+            
+            const checkInterval = setInterval(() => {
+                if (abortController.signal.aborted) {
+                    clearInterval(checkInterval);
+                    console.log('🛑 TTS прервана во время выполнения');
+                    reject(new Error('TTS прервана'));
+                    return;
+                }
+                
+                if (Date.now() - startTime >= duration) {
+                    clearInterval(checkInterval);
+                    console.log('✅ Озвучка завершена');
+                    resolve();
+                }
+            }, 100);
+            
+            // Обработчик прерывания
+            abortController.signal.addEventListener('abort', () => {
+                clearInterval(checkInterval);
+                reject(new Error('TTS прервана'));
+            });
+        });
     }
 }
 
