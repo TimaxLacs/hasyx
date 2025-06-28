@@ -31,38 +31,47 @@ class Voice{
     private defaultInputDevice: any;
     private defaultOutputDevice: any;
     private devices: any[];
-    private wakeWord: string;
+    private name: string;
     private silenceThreshold: number;
+    private isProcessing: boolean = false;
+    private currentAbortController?: AbortController;
+    private askInstance?: AskHasyx;
     
     constructor(
-        apikey: string, 
+        apikey?: string, 
         model?: string, 
+        system_prompt?: string,
+        name: string = 'алиса',
+        autoInit: boolean = true,
         temperature?: number, 
         max_tokens?: number, 
-        system_prompt?: string,
         defaultInputDevice?: any,
         defaultOutputDevice?: any,
         devices?: any[],
-        wakeWord: string = 'алиса',
         silenceThreshold: number = 2000
     ) {
-        this.apikey = apikey;
+        this.apikey = apikey || process.env.OPENROUTER_API_KEY || '';
         this.model = model;
         this.temperature = temperature;
         this.max_tokens = max_tokens;
-        this.system_prompt = system_prompt || `Ты - голосовой ассистент. Твои ответы должны быть краткими и понятными для прослушивания. 
+        
+        this.system_prompt = system_prompt || `Ты - голосовой ассистент по имени "${name}". Пользователь обращается к тебе именно по этому имени. 
+        Твои ответы должны быть краткими и понятными для прослушивания. 
         Если тебе нужно выделить важную информацию, используй формат: <VOICE>ТЕКСТ_ДЛЯ_ОЗВУЧКИ</VOICE>
         Весь остальной текст будет проигнорирован при озвучке. 
-        Старайся давать четкие и лаконичные ответы, которые удобно воспринимать на слух.`;
+        Старайся давать четкие и лаконичные ответы, которые удобно воспринимать на слух.
+        
+        Помни контекст предыдущих разговоров и используй его для более персонализированных ответов.`;
+        
         this.output_handlers = {};
         this.defaultInputDevice = defaultInputDevice;
         this.defaultOutputDevice = defaultOutputDevice;
         this.devices = devices || [];
-        this.wakeWord = wakeWord.toLowerCase();
+        this.name = name.toLowerCase();
         this.silenceThreshold = silenceThreshold;
         
         // Автоматически запускаем все необходимые функции
-        this.initialize();
+        if (autoInit) this.initialize();
     }
 
     private async initialize(): Promise<void> {
@@ -73,12 +82,50 @@ class Voice{
             // Проверка и загрузка модели
             await this.modelSTT();
             
+            // Инициализируем единый экземпляр AskHasyx для сохранения истории
+            await this.initializeAskInstance();
+            
             // Запуск голосового ассистента
             await this.transcribe();
 
             // await this.ask('выведи мне точный курс доллара на сегодня');
         } catch (error) {
             console.error('❌ Ошибка при инициализации:', error);
+        }
+    }
+
+    private async initializeAskInstance(): Promise<void> {
+        await ensureOpenRouterApiKey();
+        
+        const options: any = {
+            stream: true,
+            system_prompt: this.system_prompt
+        };
+        if (this.model) options.model = this.model;
+        if (this.temperature) options.temperature = this.temperature;
+        if (this.max_tokens) options.max_tokens = this.max_tokens;
+        
+        // Создаем единый экземпляр для сохранения истории
+        this.askInstance = new AskHasyx(
+            this.apikey,
+            {},
+            options,
+            this.system_prompt
+        );
+        
+        console.log('✅ Экземпляр ИИ инициализирован с сохранением истории');
+    }
+
+    private interruptCurrentProcess(): void {
+        if (this.isProcessing) {
+            console.log('🛑 Прерываю текущий процесс...');
+            
+            // Отменяем генерацию ИИ
+            if (this.currentAbortController) {
+                this.currentAbortController.abort();
+            }
+            
+            this.isProcessing = false;
         }
     }
 
@@ -185,34 +232,26 @@ class Voice{
     }
 
     public async ask(command: string): Promise<string> {
+        // Прерываем предыдущий процесс
+        this.interruptCurrentProcess();
+        
+        this.isProcessing = true;
+        this.currentAbortController = new AbortController();
+        
         try {
-            await ensureOpenRouterApiKey();
+            // Проверяем, что экземпляр инициализирован
+            if (!this.askInstance) {
+                await this.initializeAskInstance();
+            }
             
-            const options: any = {
-                stream: true,
-                system_prompt: this.system_prompt
-            };
-            if (this.model) options.model = this.model;
-            if (this.temperature) options.temperature = this.temperature;
-            if (this.max_tokens) options.max_tokens = this.max_tokens;
-            
-            console.log('\n🔧 Настройки запроса:');
-            console.log('📋 Системный промпт:', this.system_prompt);
-            console.log('⚙️ Опции:', options);
-            
-            const ask = new AskHasyx(
-                this.apikey,
-                { command },
-                options,
-                this.system_prompt
-            );
-
             console.log('\n🤖 Отправляю запрос к нейросети...');
             
             let fullResponse = '';
             let currentVoiceText = '';
             let isInsideVoiceTag = false;
-            const stream = await ask.askStream(command);
+            
+            // Используем единый экземпляр для сохранения истории
+            const stream = await this.askInstance!.askStream(command);
             
             // Функция для разбиения текста на предложения
             const splitIntoSentences = (text: string): string[] => {
@@ -221,9 +260,12 @@ class Voice{
 
             // Функция для обработки накопленного текста
             const processAccumulatedText = async (text: string) => {
+                // Проверяем прерывание перед TTS
+                if (this.currentAbortController?.signal.aborted) return;
+                
                 const sentences = splitIntoSentences(text);
                 for (const sentence of sentences) {
-                    if (sentence.trim()) {
+                    if (sentence.trim() && !this.currentAbortController?.signal.aborted) {
                         await this.TTS(sentence.trim());
                     }
                 }
@@ -232,6 +274,12 @@ class Voice{
             return new Promise((resolve, reject) => {
                 stream.subscribe({
                     next: async (chunk: string) => {
+                        // Проверяем прерывание
+                        if (this.currentAbortController?.signal.aborted) {
+                            reject(new Error('Прервано пользователем'));
+                            return;
+                        }
+                        
                         process.stdout.write(chunk);
                         fullResponse += chunk;
                         
@@ -269,7 +317,9 @@ class Voice{
                                     if (sentences.length > 1) {
                                         // Обрабатываем все предложения кроме последнего
                                         for (let j = 0; j < sentences.length - 1; j++) {
-                                            await this.TTS(sentences[j].trim());
+                                            if (!this.currentAbortController?.signal.aborted) {
+                                                await this.TTS(sentences[j].trim());
+                                            }
                                         }
                                         // Оставляем последнее предложение в буфере
                                         currentVoiceText = sentences[sentences.length - 1];
@@ -284,7 +334,7 @@ class Voice{
                     },
                     complete: async () => {
                         // Обрабатываем оставшийся текст при завершении
-                        if (currentVoiceText.trim()) {
+                        if (currentVoiceText.trim() && !this.currentAbortController?.signal.aborted) {
                             await processAccumulatedText(currentVoiceText);
                         }
                         console.log('\n✅ Ответ нейросети получен');
@@ -295,12 +345,14 @@ class Voice{
         } catch (error) {
             console.error('❌ Ошибка при обращении к нейросети:', error);
             return 'Произошла ошибка при обращении к нейросети';
+        } finally {
+            this.isProcessing = false;
         }
     }
 
     public async transcribe(): Promise<void> {
         console.log('🎤 Начинаю работу голосового ассистента...');
-        console.log(`🔑 Ключевое слово: "${this.wakeWord}"`);
+        console.log(`🔑 Ключевое слово: "${this.name}"`);
     
         if (!fs.existsSync(MODEL_PATH)) {
             console.error(`❌ Модель не найдена по пути: ${MODEL_PATH}`);
@@ -436,9 +488,12 @@ class Voice{
                     console.log(`\n🔍 Распознано: "${text}"`);
                     lastSpeechTime = Date.now();
 
-                    if (!isListening && text.includes(this.wakeWord)) {
+                    if (!isListening && text.includes(this.name)) {
+                        // Прерываем текущий процесс при активации
+                        this.interruptCurrentProcess();
+                        
                         isListening = true;
-                        console.log(`\n🎯 Ключевое слово "${this.wakeWord}" обнаружено! Слушаю команду...`);
+                        console.log(`\n🎯 Ключевое слово "${this.name}" обнаружено! Слушаю команду...`);
                         commandBuffer.push(result.text);
                         console.log(`🎤 Команда: ${result.text}`);
                         lastPartialResult = '';
@@ -499,6 +554,12 @@ class Voice{
     }
 
     public async TTS(text: string): Promise<void> {
+        // Проверяем прерывание перед TTS
+        if (this.currentAbortController?.signal.aborted) {
+            console.log('🛑 TTS прерван');
+            return;
+        }
+        
         const startTime = Date.now();
         console.log(`📝 Текст для озвучки: "${text}"`);        // Здесь будет реальная реализация TTS
         // Пока просто имитируем задержку синтеза
@@ -508,17 +569,20 @@ class Voice{
     }
 }
 
-// Пример использования - теперь достаточно просто создать экземпляр
-const voice = new Voice(
-    process.env.OPENROUTER_API_KEY!,
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    'алиса', // ключевое слово
-    2000    // порог тишины в миллисекундах
-);
+// Пример использования - теперь можно создать экземпляр без параметров
+const voice = new Voice();
+
+// Или с кастомными параметрами
+// const voice = new Voice(
+//     process.env.OPENROUTER_API_KEY!,
+//     undefined,
+//     undefined,
+//     undefined,
+//     undefined,
+//     undefined,
+//     undefined,
+//     undefined,
+//     'алиса', // ключевое слово
+//     2000    // порог тишины в миллисекундах
+// );
 
