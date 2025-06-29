@@ -86,7 +86,7 @@ class AudioDeviceManager {
         return this.devices;
     }
 
-    findDefaultDevices(): { defaultInputDevice: AudioDevice | null, defaultOutputDevice: AudioDevice | null } {
+    findDefaultDevices(inputDevice?: AudioDevice, outputDevice?: AudioDevice): { defaultInputDevice: AudioDevice | null, defaultOutputDevice: AudioDevice | null } {
         const devices = this.getDevices();
         
         if (!devices || devices.length === 0) {
@@ -101,6 +101,8 @@ class AudioDeviceManager {
             const name = device.name.toLowerCase();
             let score = 0;
 
+            if (inputDevice && inputDevice.name === device.name) score += 100;
+            if (outputDevice && outputDevice.name === device.name) score += 100;
             if (name.includes('headset') || name.includes('наушники') || name.includes('garniture')) score += 50;
             if (name.includes('usb')) score += 20;
             if (name.includes('bluetooth')) score += 20;

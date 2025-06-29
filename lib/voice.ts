@@ -3,7 +3,7 @@ import { AskHasyx, ensureOpenRouterApiKey } from 'hasyx/lib/ask-hasyx';
 import AdmZip from 'adm-zip';
 import path from 'path';
 // @ts-ignore
-import * as vosk from 'vosk';
+// import * as vosk from 'vosk'; // ВРЕМЕННО ЗАКОММЕНТИРОВАНО - проблемы с ffi-napi
 import * as fs from 'fs';
 import * as https from 'https';
 import { spawn } from 'child_process';
@@ -12,15 +12,7 @@ const DEFAULT_MODEL_STT = 'vosk-model-small-ru-0.22';
 const MODEL_PATH = path.resolve(__dirname, './models', DEFAULT_MODEL_STT);
 const SAMPLE_RATE = 16000;
 
-/**
- * Голосовой ассистент с поддержкой кроссплатформенного распознавания речи
- * 
- * Особенности:
- * - Автоматический выбор лучшего доступного микрофона (Bluetooth, USB, встроенный)
- * - Кроссплатформенная поддержка (Linux: ALSA/PulseAudio, Windows/macOS: RtAudio)
- * - Динамическое отслеживание подключения новых устройств
- * - Умная система приоритетов устройств (headset +50, Bluetooth +20, USB +20)
- */
+
 class Voice{
     private apikey: string;
     private model?: string;
@@ -47,7 +39,6 @@ class Voice{
         model?: string, 
         system_prompt?: string,
         name: string = 'алиса',
-        autoInit: boolean = true,
         temperature?: number, 
         max_tokens?: number, 
         defaultInputDevice?: any,
@@ -70,7 +61,7 @@ We are working together on this project. When we need to execute code, analyze d
 - For simple questions, conversations, or general knowledge - respond directly without code execution
 - Use proper error handling and provide helpful explanations
 - Keep responses focused and practical
-- Since this is a voice interface, keep responses concise and easy to listen to
+- Since this is a voice interface, keep responses concise and easy to listen to and hear.
 
 **IMPORTANT CODE EXECUTION RULES:**
 - When you need to execute JavaScript, you MUST use the exact format: > 😈<uuid>/do/exec/js followed by \`\`\`js
@@ -113,10 +104,9 @@ echo "Hello World"
         this.silenceThreshold = silenceThreshold;
         
         // Автоматически запускаем все необходимые функции
-        if (autoInit) this.initialize();
     }
 
-    private async initialize(): Promise<void> {
+    public async initialize(): Promise<void> {
         try {
             // Инициализация устройств
             await this.device();
@@ -128,7 +118,8 @@ echo "Hello World"
             await this.initializeAskInstance();
             
             // Запуск голосового ассистента
-            await this.transcribe();
+            // await this.transcribe(); // ВРЕМЕННО ЗАКОММЕНТИРОВАНО - проблемы с vosk
+            console.log('✅ Инициализация завершена (без transcribe)');
 
             // await this.ask('выведи мне точный курс доллара на сегодня');
         } catch (error) {
@@ -136,7 +127,7 @@ echo "Hello World"
         }
     }
 
-    private async initializeAskInstance(): Promise<void> {
+    public async initializeAskInstance(): Promise<void> {
         await ensureOpenRouterApiKey();
         
         const options: any = {
@@ -161,11 +152,9 @@ echo "Hello World"
             this.system_prompt,
             askOptions
         );
-        
-        console.log('✅ Экземпляр ИИ инициализирован с сохранением истории');
-    }
+        }
 
-    private interruptCurrentProcess(): void {
+    public interruptCurrentProcess(): void {
         console.log('🛑 Прерываю все текущие процессы...');
         
         // Отменяем генерацию ИИ
@@ -189,11 +178,11 @@ echo "Hello World"
         this.isTTSActive = false;
     }
 
-    public async device(): Promise<void> {
+    public async device(inputDevice?: any, outputDevice?: any): Promise<void> {
         const manager = new AudioDeviceManager();
         await manager.initialize();
         
-        const { defaultInputDevice, defaultOutputDevice } = manager.findDefaultDevices();
+        const { defaultInputDevice, defaultOutputDevice } = manager.findDefaultDevices(inputDevice, outputDevice);
         const devices = manager.getDevices();
         
         this.defaultInputDevice = defaultInputDevice;
@@ -429,9 +418,9 @@ echo "Hello World"
             }
         }
     
-        vosk.setLogLevel(-1);
-        const model = new vosk.Model(MODEL_PATH);
-        const recognizer = new vosk.Recognizer({ model: model, sampleRate: SAMPLE_RATE });
+        // vosk.setLogLevel(-1);
+        // const model = new vosk.Model(MODEL_PATH);
+        // const recognizer = new vosk.Recognizer({ model: model, sampleRate: SAMPLE_RATE });
     
         // Создаем AudioDeviceManager для динамического управления устройствами
         const deviceManager = new AudioDeviceManager();
@@ -442,8 +431,8 @@ echo "Hello World"
         
         if (!bestInputDevice) {
             console.error('❌ Не удалось определить устройство ввода. Выход.');
-            recognizer.free();
-            model.free();
+            // recognizer.free();
+            // model.free();
             return;
         }
         
@@ -478,8 +467,8 @@ echo "Hello World"
                 
             } catch (error) {
                 console.error('❌ Ошибка инициализации RtAudio:', error);
-                recognizer.free();
-                model.free();
+                // recognizer.free();
+                // model.free();
                 return;
             }
         } else {
@@ -550,6 +539,8 @@ echo "Hello World"
         const deviceCheckInterval = setInterval(checkDeviceChanges, 5000); // Проверяем каждые 5 секунд
     
         arecord.stdout.on('data', (data) => {
+            // ВРЕМЕННО ЗАКОММЕНТИРОВАНО - проблемы с vosk
+            /*
             if (recognizer.acceptWaveform(data)) {
                 const result = recognizer.result();
                 if (result.text) {
@@ -610,6 +601,10 @@ echo "Hello World"
                     }
                 }
             }
+            */
+            
+            // ВРЕМЕННАЯ ЗАГЛУШКА - просто логируем, что получили аудиоданные
+            console.log(`📡 Получены аудиоданные: ${data.length} байт`);
         });
     
         arecord.stderr.on('data', (data) => {
@@ -624,8 +619,8 @@ echo "Hello World"
             if (deviceManager.requiresRtAudio()) {
                 deviceManager.stopAudioStream();
             }
-            recognizer.free();
-            model.free();
+            // recognizer.free();
+            // model.free();
         };
         
         process.on('SIGINT', () => {
@@ -658,7 +653,7 @@ echo "Hello World"
         }
     }
     
-    private async processTTSQueue(): Promise<void> {
+    public async processTTSQueue(): Promise<void> {
         if (this.isTTSActive || this.ttsQueue.length === 0) {
             return;
         }
@@ -700,7 +695,7 @@ echo "Hello World"
         this.isTTSActive = false;
     }
     
-    private async executeTTS(text: string, abortController: AbortController): Promise<void> {
+    public async executeTTS(text: string, abortController: AbortController): Promise<void> {
         return new Promise((resolve, reject) => {
             // Проверяем прерывание перед началом
             if (abortController.signal.aborted) {
@@ -738,20 +733,5 @@ echo "Hello World"
     }
 }
 
-// Пример использования - теперь можно создать экземпляр без параметров
-const voice = new Voice();
-
-// Или с кастомными параметрами
-// const voice = new Voice(
-//     process.env.OPENROUTER_API_KEY!,
-//     undefined,
-//     undefined,
-//     undefined,
-//     undefined,
-//     undefined,
-//     undefined,
-//     undefined,
-//     'алиса', // ключевое слово
-//     2000    // порог тишины в миллисекундах
-// );
+export default Voice;
 
