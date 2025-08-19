@@ -2,16 +2,21 @@ import AudioDeviceManager from './voice-device';
 import { OpenRouterProvider } from './ai/providers/openrouter';
 import type { AIMessage } from './ai/ai';
 import path from 'path';
-// @ts-ignore
-// import * as vosk from 'vosk'; // ВРЕМЕННО ЗАКОММЕНТИРОВАНО - проблемы с ffi-napi
 import * as fs from 'fs';
-// import * as https from 'https'; // больше не требуется
+import { WaveFile as WaveFileOriginal } from 'wavefile';
 import { spawn } from 'child_process';
+import { fileURLToPath } from 'url';
+import http from 'http';
+import { spawnSync } from 'child_process';
+import AdmZip from 'adm-zip';
+import * as vosk from 'vosk';
+import * as https from 'https';
 
+const DEFAULT_MODEL_STT = 'vosk-model-small-ru-0.22';
+const MODEL_PATH = path.resolve(__dirname, './models', DEFAULT_MODEL_STT);
 const SAMPLE_RATE = 16000;
 
-
-class Voice{
+class Voice {
     private apikey: string;
     private model?: string;
     private temperature?: number;
@@ -30,6 +35,35 @@ class Voice{
     private ttsQueue: Array<{ text: string; abortController: AbortController }> = [];
     private currentTTS?: { text: string; abortController: AbortController };
     private isTTSActive: boolean = false;
+
+    // Восстанавливаем поля для активации по ключевому слову
+    private isListening: boolean = false;
+    private commandBuffer: string[] = [];
+    private lastSpeechTime: number = 0;
+    private lastPartialResult: string = '';
+    private currentInputDevice: any;
+
+    // Фоновый слушатель и ожидатели результатов
+    private listeningStarted: boolean = false;
+    private pendingResolvers: Array<(text: string) => void> = [];
+    private arecordProcess?: any;
+    private audioInputStream?: NodeJS.ReadableStream;
+    private vadInstance?: any;
+    private utteranceChunks: Buffer[] = [];
+    private isAwaitingCommand: boolean = false;
+    private commandParts: string[] = [];
+    private silenceTimer: NodeJS.Timeout | null = null;
+    private zonosProjectDir: string;
+    private defaultReferencePath: string;
+    private resultsQueue: Array<{ id: number; text: string; ts: number }> = [];
+    private lastFinalResult: string = '';
+    private utteranceCounter: number = 0;
+    private resultWatcherInterval?: NodeJS.Timeout;
+
+    // Таймеры для проверки тишины и изменений устройств
+    private silenceCheckInterval?: NodeJS.Timeout;
+    private deviceCheckInterval?: NodeJS.Timeout;
+
     
     constructor(
         apikey?: string, 
@@ -41,7 +75,8 @@ class Voice{
         defaultInputDevice?: any,
         defaultOutputDevice?: any,
         devices?: any[],
-        silenceThreshold: number = 2000
+        silenceThreshold: number = 2000,
+
     ) {
         this.apikey = apikey || process.env.OPENROUTER_API_KEY || '';
         this.model = model;
@@ -98,19 +133,35 @@ echo "Hello World"
         this.devices = devices || [];
         this.name = name.toLowerCase();
         this.silenceThreshold = silenceThreshold;
-        
-        // Автоматически запускаем все необходимые функции
+        this.zonosProjectDir = '/home/timax/projects/zonosjs-test';
+        this.defaultReferencePath = '/home/timax/projects/zonosjs-test/reference.wav';
     }
 
     public async initialize(): Promise<void> {
         try {
-
-            console.log('🧪 Запуск');
             await this.device();
-
-            console.log('🧪 Тест транскрибации (Whisper/base)...');
-            const transcriptionResult = await this.transcribe();
-            console.log('📝 Результат транскрибации:', transcriptionResult);
+            void this.transcribe();
+            
+            // Обработчик результатов только для команд, прошедших через активацию
+            if (this.resultWatcherInterval) clearInterval(this.resultWatcherInterval);
+            this.resultWatcherInterval = setInterval(async () => {
+                while (this.resultsQueue.length > 0) {
+                    const item = this.resultsQueue.shift();
+                    if (!item) break;
+                    
+                    console.log('🔔 Обрабатываю команду:', item.text);
+                    try {
+                        const resultAsk = await this.ask(item.text);
+                        console.log('🔔 Ответ нейросети:', resultAsk);
+                    } catch (error) {
+                        if (error instanceof Error && error.message.includes('Прервано пользователем')) {
+                            console.log('🛑 Команда прервана пользователем');
+                        } else {
+                            console.error('❌ Ошибка при обработке команды:', error);
+                        }
+                    }
+                }
+            }, 100);
         } catch (error) {
             console.error('❌ Ошибка при инициализации:', error);
         }
@@ -170,7 +221,306 @@ echo "Hello World"
         console.log('Динамики:', this.defaultOutputDevice?.name || 'не найдены');
     }
 
-    // Удалено: установка и распаковка Vosk модели (не используется)
+
+    public async transcribe(): Promise<void> {
+        console.log('🎤 Запуск транскрибатора (микрофон + Vosk)...');
+        if (!fs.existsSync(MODEL_PATH)) {
+            console.log('ℹ️ Модель отсутствует, запускаю установку...');
+            const modelUrl = 'https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip';
+            const zipPath = path.resolve(__dirname, './models/vosk-model.zip');
+
+            if (fs.existsSync(zipPath)) {
+                try { fs.unlinkSync(zipPath); } catch {}
+            }
+
+            console.log('⏳ Начинаю загрузку модели...');
+            console.log(`📥 Загрузка модели с ${modelUrl}`);
+            await new Promise<void>((resolve, reject) => {
+                const file = fs.createWriteStream(zipPath);
+                let downloadedBytes = 0;
+                let totalBytes = 0;
+
+                https.get(modelUrl, (response) => {
+                    totalBytes = parseInt(response.headers['content-length'] || '0', 10);
+                    console.log(`📦 Общий размер файла: ${(totalBytes / 1024 / 1024).toFixed(2)}MB`);
+                    response.on('data', (chunk) => {
+                        downloadedBytes += chunk.length;
+                        const progress = (downloadedBytes / totalBytes * 100).toFixed(2);
+                        process.stdout.write(`\r📥 Загрузка: ${progress}% (${(downloadedBytes / 1024 / 1024).toFixed(2)}MB)`);
+                    });
+                    response.on('end', () => {
+                        process.stdout.write('\n');
+                        file.end();
+                    });
+                    response.pipe(file);
+                    file.on('finish', () => {
+                        file.close();
+                        console.log('✅ Загрузка модели завершена.');
+                        resolve();
+                    });
+                }).on('error', (err) => {
+                    fs.unlink(zipPath, () => {});
+                    console.error('❌ Ошибка при загрузке модели:', err);
+                    reject(err);
+                });
+            });
+
+            try {
+                console.log('📦 Начинаю распаковку модели...');
+                const zip = new AdmZip(zipPath);
+                const zipEntries = zip.getEntries();
+                const rootDir = zipEntries[0].entryName.split('/')[0];
+                console.log(`📂 Распаковка ${zipEntries.length} файлов...`);
+                const modelsDir = path.resolve(__dirname, './models');
+                if (!fs.existsSync(modelsDir)) {
+                    fs.mkdirSync(modelsDir, { recursive: true });
+                }
+                zip.extractAllTo(modelsDir, true);
+                console.log(`📂 Распаковка завершена: ${zipEntries.length} файлов`);
+                fs.renameSync(path.resolve(modelsDir, rootDir), MODEL_PATH);
+                console.log('✅ Базовая модель успешно установлена.');
+            } catch (err) {
+                console.error('❌ Ошибка при установке модели:', err);
+                throw err;
+            } finally {
+                const zipPath = path.resolve(__dirname, './models/vosk-model.zip');
+                if (fs.existsSync(MODEL_PATH) && fs.existsSync(zipPath)) {
+                    try { fs.unlinkSync(zipPath); } catch {}
+                    console.log('🗑️ Временный zip-файл удален.');
+                }
+            }
+        }
+
+        // Инициализация Vosk
+        vosk.setLogLevel(-1);
+        const model = new vosk.Model(MODEL_PATH);
+        const recognizer = new vosk.Recognizer({ model: model, sampleRate: SAMPLE_RATE });
+
+        // Запуск устройства захвата звука
+        const deviceManager = new AudioDeviceManager();
+        await deviceManager.initialize();
+        let selectedInputDevice = this.defaultInputDevice;
+        if (!selectedInputDevice) {
+            selectedInputDevice = await deviceManager.getBestInputDevice();
+        }
+        if (!selectedInputDevice) {
+            console.error('❌ Не удалось определить устройство ввода. Выход.');
+            try { recognizer.free(); } catch {}
+            try { model.free(); } catch {}
+            return;
+        }
+        
+        // Инициализируем текущее устройство для отслеживания изменений
+        this.currentInputDevice = selectedInputDevice;
+        console.log(`🎧 Использую устройство ввода: ${selectedInputDevice.name} (ID: ${selectedInputDevice.id})`);
+
+        let arecord: any;
+        let audioStream: NodeJS.ReadableStream | null = null;
+        if (deviceManager.requiresRtAudio()) {
+            try {
+                console.log('🔧 Использую RtAudio для Windows/macOS');
+                audioStream = await deviceManager.recordAudioStream(selectedInputDevice, SAMPLE_RATE, 1);
+                arecord = {
+                    stdout: audioStream,
+                    stderr: { on: () => {} },
+                    on: (event: string, callback: Function) => {
+                        if (event === 'close') {
+                            audioStream?.on('end', () => callback(0));
+                        }
+                    },
+                    kill: () => {
+                        deviceManager.stopAudioStream();
+                        if (audioStream && 'destroy' in audioStream) {
+                            (audioStream as any).destroy();
+                        }
+                    }
+                };
+            } catch (error) {
+                console.error('❌ Ошибка инициализации RtAudio:', error);
+                try { recognizer.free(); } catch {}
+                try { model.free(); } catch {}
+                return;
+            }
+        } else {
+            try {
+                const recordCommand = deviceManager.getRecordCommand(selectedInputDevice, SAMPLE_RATE);
+                console.log(`🔧 Команда записи: ${recordCommand.join(' ')}`);
+                arecord = spawn(recordCommand[0], recordCommand.slice(1));
+            } catch (error) {
+                console.warn('⚠️ Ошибка при получении команды записи, использую fallback:', error);
+                const recordCommand = deviceManager.getRecordCommand(selectedInputDevice, SAMPLE_RATE);
+                console.log(`🔧 Используется команда записи: ${recordCommand.join(' ')}`);
+                arecord = spawn(recordCommand[0], recordCommand.slice(1));
+            }
+        }
+
+        // Обработка аудиопотока: активация по ключевому слову и сбор команды
+        arecord.stdout.on('data', (data) => {
+            try {
+                if (recognizer.acceptWaveform(data)) {
+                    const result = recognizer.result();
+                    if (result && result.text) {
+                        const text = result.text.toLowerCase();
+                        console.log(`🟩 Итог: ${result.text}`);
+                        this.lastSpeechTime = Date.now();
+
+                        // Проверяем активацию по ключевому слову
+                        if (!this.isListening && text.includes(this.name)) {
+                            // МГНОВЕННО прерываем все текущие процессы при активации
+                            this.interruptCurrentProcess();
+                            
+                            this.isListening = true;
+                            console.log(`\n🎯 Ключевое слово "${this.name}" обнаружено! Слушаю команду...`);
+                            this.commandBuffer.push(result.text);
+                            console.log(`🎤 Команда: ${result.text}`);
+                            this.lastPartialResult = '';
+                            return;
+                        }
+                        
+                        // Также проверяем прерывание во время слушания команды
+                        if (this.isListening && text.includes(this.name) && this.commandBuffer.length > 0) {
+                            // Если во время слушания команды снова услышали имя - начинаем новую команду
+                            console.log(`\n🔄 Новое обращение "${this.name}" во время команды - перезапускаю...`);
+                            this.interruptCurrentProcess();
+                            this.commandBuffer = [result.text];
+                            console.log(`🎤 Новая команда: ${result.text}`);
+                            this.lastPartialResult = '';
+                            return;
+                        }
+
+                        if (this.isListening) {
+                            const lastBuffer = this.commandBuffer[this.commandBuffer.length - 1] || '';
+                            if (!lastBuffer.includes(text) && !text.includes(lastBuffer)) {
+                                this.commandBuffer.push(result.text);
+                                console.log(`🎤 Команда: ${result.text}`);
+                            }
+                            this.lastPartialResult = '';
+                        }
+                    }
+                } else {
+                    const partialResult = recognizer.partialResult();
+                    if (partialResult.partial) {
+                        const partialText = partialResult.partial.toLowerCase();
+                        
+                        // Проверяем прерывание даже в частичных результатах для быстрого реагирования
+                        if (partialText.includes(this.name)) {
+                            // Если услышали имя в частичном результате во время обработки - прерываем
+                            if (this.isProcessing || this.isTTSActive) {
+                                console.log(`\n⚡ Быстрое прерывание по частичному результату: "${partialText}"`);
+                                this.interruptCurrentProcess();
+                            }
+                        }
+                        
+                        if (this.isListening && partialResult.partial !== this.lastPartialResult) {
+                            console.log(`🎤 Команда: ${partialResult.partial}`);
+                            this.lastPartialResult = partialResult.partial;
+                        }
+                    }
+                }
+            } catch (e) {
+                console.error('❌ Ошибка распознавания:', e);
+            }
+        });
+
+        arecord.stderr.on('data', (data) => {
+            console.error(`❌ Ошибка arecord: ${data}`);
+        });
+
+        const cleanup = () => {
+            console.log('\nВыполняю очистку и завершаю работу...');
+            
+            // Очищаем все таймеры
+            if (this.silenceCheckInterval) {
+                clearInterval(this.silenceCheckInterval);
+                this.silenceCheckInterval = undefined;
+            }
+            if (this.deviceCheckInterval) {
+                clearInterval(this.deviceCheckInterval);
+                this.deviceCheckInterval = undefined;
+            }
+            if (this.resultWatcherInterval) {
+                clearInterval(this.resultWatcherInterval);
+                this.resultWatcherInterval = undefined;
+            }
+            
+            // Сбрасываем состояние
+            this.isListening = false;
+            this.commandBuffer = [];
+            this.isProcessing = false;
+            
+            arecord.kill();
+            if (deviceManager.requiresRtAudio()) {
+                deviceManager.stopAudioStream();
+            }
+            try { recognizer.free(); } catch {}
+            try { model.free(); } catch {}
+        };
+        
+        process.on('SIGINT', () => {
+            cleanup();
+            process.exit(0);
+        });
+        
+        arecord.on('close', (code) => {
+            if (code !== 0 && code !== null) { 
+                 console.log(`arecord процесс завершился с кодом ${code}`);
+            }
+            cleanup();
+        });
+    
+        // Логика проверки тишины и завершения команды
+        const checkSilence = async () => {
+            if (this.isListening && !this.isProcessing && (Date.now() - this.lastSpeechTime) > this.silenceThreshold) {
+                if (this.commandBuffer.length > 0) {
+                    const fullCommand = this.commandBuffer.join(' ');
+                    console.log('\n📝 Полная команда:', fullCommand);
+                    
+                    // Сброс до отправки
+                    this.commandBuffer = [];
+                    this.isListening = false;
+                    this.isProcessing = true;
+                    
+                    try {
+                        // Добавляем команду в очередь результатов для обработки
+                        this.resultsQueue.push({ 
+                            id: ++this.utteranceCounter, 
+                            text: fullCommand, 
+                            ts: Date.now() 
+                        });
+                        console.log('✅ Команда добавлена в очередь для обработки');
+                    } catch (error) {
+                        console.error('❌ Ошибка при добавлении команды в очередь:', error);
+                    }
+                    
+                    this.isProcessing = false;
+                    console.log('\n👂 Ожидание ключевого слова...');
+                }
+            }
+        };
+
+        // Проверка на изменения устройств (для Bluetooth)
+        const checkDeviceChanges = async () => {
+            if (!this.isProcessing) {
+                try {
+                    const newBestDevice = await deviceManager.getBestInputDevice();
+                    if (newBestDevice && newBestDevice.id !== this.currentInputDevice?.id) {
+                        console.log(`\n🔄 Обнаружено новое лучшее устройство: ${newBestDevice.name}`);
+                        console.log('⚠️ Для переключения устройства потребуется перезапуск...');
+                        this.currentInputDevice = newBestDevice;
+                    }
+                } catch (error) {
+                    console.warn('⚠️ Ошибка при проверке устройств:', error);
+                }
+            }
+        };
+
+        // Запускаем таймеры проверки
+        this.silenceCheckInterval = setInterval(checkSilence, 100);
+        this.deviceCheckInterval = setInterval(checkDeviceChanges, 5000); // Проверяем каждые 5 секунд
+
+        console.log('✅ Микрофон запущен. Говорите... (Ctrl+C для остановки)');
+        console.log('👂 Ожидание ключевого слова...');
+    }
 
     public async ask(command: string): Promise<string> {
         // Прерываем предыдущий процесс
@@ -286,455 +636,105 @@ echo "Hello World"
         }
     }
 
-    public async transcribe(): Promise<string> {
-        console.log('🎤 Начинаю работу голосового ассистента...');
-        console.log(`🔑 Ключевое слово: "${this.name}"`);
 
-        // ===== Whisper: локальные помощники (в пределах функции) =====
-        const spawnAsync = (cmd: string, args: string[], options: any = {}): Promise<void> => {
-            return new Promise((resolve, reject) => {
-                const p = spawn(cmd, args, options);
-                let stderr = '';
-                p.stderr.on('data', d => { stderr += d.toString(); });
-                p.on('error', reject);
-                p.on('close', code => {
-                    if (code === 0) resolve();
-                    else reject(new Error(`${cmd} ${args.join(' ')} exited with code ${code}: ${stderr}`));
-                });
+
+    public async TTS(text?: string): Promise<void> {
+        const ttsText = text?.trim().length ? text.trim() : 'Привет мир.';
+        const port = 5000;
+
+        // Если сервер уже доступен — перезапускаем
+        const isUp = await new Promise<boolean>((resolve) => {
+            const req = http.get({ hostname: 'localhost', port, path: '/', timeout: 2000 }, (res) => {
+                resolve(res.statusCode === 200);
             });
-        };
-
-        const ensureWhisper = async () => {
-            try {
-                // динамический импорт без типизации
-                // eslint-disable-next-line @typescript-eslint/no-var-requires
-                require('nodejs-whisper');
-            } catch {
-                console.log('📦 Устанавливаю nodejs-whisper...');
-                // Ставим пакет в корне проекта
-                const cwd = path.resolve(__dirname, '..');
-                try {
-                    await spawnAsync('npm', ['i', '--no-audit', '--no-fund', 'nodejs-whisper'], { cwd });
-                } catch (e) {
-                    console.error('❌ Не удалось установить nodejs-whisper:', e);
-                    throw e;
-                }
-            }
-        };
-
-        const convertPcmToWav = async (rawPcmPath: string): Promise<void> => {
-            const wavPath = rawPcmPath.replace('.pcm', '.wav');
-            const args = ['-y', '-f', 's16le', '-ar', String(SAMPLE_RATE), '-ac', '1', '-i', rawPcmPath, '-ar', '16000', '-ac', '1', '-f', 'wav', wavPath];
-            await spawnAsync('ffmpeg', args);
-        };
-
-        const whisperTranscribe = async (audioBuffer: Buffer): Promise<string> => {
-            await ensureWhisper();
-            try {
-                // eslint-disable-next-line @typescript-eslint/no-var-requires
-                const mod = (() => { try { return require('nodejs-whisper'); } catch { return undefined as any; } })();
-                if (!mod || !('nodewhisper' in mod)) {
-                    throw new Error('nodejs-whisper недоступен');
-                }
-                const { nodewhisper } = mod as any;
-                
-                // Создаем временные файлы для обработки
-                const tempPcmPath = path.resolve(__dirname, `temp_${Date.now()}_${Math.random().toString(36).slice(2)}.pcm`);
-                const tempWavPath = tempPcmPath.replace('.pcm', '.wav');
-                
-                try {
-                    // Записываем PCM данные во временный файл
-                    await fs.promises.writeFile(tempPcmPath, audioBuffer);
-                    
-                    // Конвертируем PCM в WAV для Whisper
-                    await convertPcmToWav(tempPcmPath);
-                    
-                    const result = await nodewhisper(tempWavPath, {
-                        modelName: 'base',
-                        autoDownloadModelName: 'base',
-                        removeWavFileAfterTranscription: true,
-                        whisperOptions: { outputInText: true, language: 'ru' }
+            req.on('error', () => resolve(false));
+            req.on('timeout', () => { req.destroy(); resolve(false); });
+        });
+        if (isUp) {
+            console.log(`Обнаружен уже запущенный zonosjs на http://localhost:${port}/ — перезапускаю.`);
+            try { spawnSync('fuser', ['-k', `${port}/tcp`], { stdio: 'ignore' }); } catch {}
+            try { spawnSync('bash', ['-lc', `lsof -ti :${port} | xargs -r kill -9`], { stdio: 'ignore' }); } catch {}
+            const downStart = Date.now();
+            while (Date.now() - downStart < 60_000) {
+                const stillUp = await new Promise<boolean>((resolve) => {
+                    const req2 = http.get({ hostname: 'localhost', port, path: '/', timeout: 1000 }, (res) => {
+                        res.resume();
+                        resolve(true);
                     });
-                    
-                    if (result?.text) return String(result.text).trim();
-                    return '';
-                } finally {
-                    // Очищаем временные файлы
-                    await fs.promises.unlink(tempPcmPath).catch(() => {});
-                    await fs.promises.unlink(tempWavPath).catch(() => {});
-                }
-            } catch (e) {
-                console.error('❌ Ошибка транскрипции Whisper:', e);
-                return '';
+                    req2.on('error', () => resolve(false));
+                    req2.on('timeout', () => { req2.destroy(); resolve(true); });
+                });
+                if (!stillUp) break;
+                await new Promise(r => setTimeout(r, 500));
             }
-        };
-
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        const { Transform } = require('stream');
-        const silenceMs = this.silenceThreshold;
-        const createVAD = () => {
-            let silenceTimer: NodeJS.Timeout | null = null;
-            let baselineEnergy = 0.0003;
-            const alpha = 0.99;
-            const voiceRatioThreshold = 3.0;
-            const hangoverMs = Math.min(400, Math.max(200, Math.floor(silenceMs * 0.2)));
-            let lastVoiceAt = 0;
-
-            const vad = new Transform({
-                transform(chunk: Buffer, _enc, cb) {
-                    let sumAbs = 0;
-                    const samples = Math.floor(chunk.length / 2);
-                    for (let i = 0; i < chunk.length; i += 2) {
-                        sumAbs += Math.abs(chunk.readInt16LE(i));
-                    }
-                    let energy = (sumAbs / samples) / 32767;
-
-                    const isLikelyVoice = energy > baselineEnergy * voiceRatioThreshold;
-                    if (!isLikelyVoice) {
-                        baselineEnergy = alpha * baselineEnergy + (1 - alpha) * energy;
-                    }
-                    const now = Date.now();
-                    if (isLikelyVoice) {
-                        (vad as any).emit('voice');
-                        lastVoiceAt = now;
-                        if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
-                        silenceTimer = setTimeout(() => (vad as any).emit('silence'), Math.max(1, silenceMs));
-                    } else {
-                        if (!silenceTimer && now - lastVoiceAt > hangoverMs) {
-                            silenceTimer = setTimeout(() => (vad as any).emit('silence'), Math.max(1, silenceMs));
-                        }
-                    }
-                    this.push(chunk);
-                    cb();
-                }
-            });
-            return vad as any;
-        };
-
-        // Создаем AudioDeviceManager для динамического управления устройствами
-        const deviceManager = new AudioDeviceManager();
-        await deviceManager.initialize();
-
-        // Получаем лучшее доступное устройство
-        const bestInputDevice = await deviceManager.getBestInputDevice();
-
-        if (!bestInputDevice) {
-            console.error('❌ Не удалось определить устройство ввода. Выход.');
-            return 'Ошибка: не удалось определить устройство ввода';
         }
 
-        console.log(`🎧 Использую устройство ввода: ${bestInputDevice.name} (ID: ${bestInputDevice.id})`);
+        // Запуск сервера
+        const localBin = path.join(this.zonosProjectDir, 'node_modules', '.bin', 'zonosjs');
+        console.log(`Запуск сервера zonosjs на порту: ${port}...`);
+        const server = spawn(localBin, ['serve', '--port', port.toString()], {
+            stdio: ['pipe', 'pipe', 'pipe'],
+            cwd: this.zonosProjectDir
+        });
+        server.stdout.on('data', (data: Buffer) => console.log(`[${new Date().toISOString()}] STDOUT: ${data.toString()}`));
+        server.stderr.on('data', (data: Buffer) => console.error(`[${new Date().toISOString()}] STDERR: ${data.toString()}`));
 
-        // Кроссплатформенная инициализация записи
-        let arecord: any;
-        let audioStream: NodeJS.ReadableStream | null = null;
-
-        if (deviceManager.requiresRtAudio()) {
-            try {
-                console.log('🔧 Использую RtAudio для Windows/macOS');
-                audioStream = await deviceManager.recordAudioStream(bestInputDevice, SAMPLE_RATE, 1);
-                arecord = {
-                    stdout: audioStream,
-                    stderr: { on: () => {} },
-                    on: (event: string, callback: Function) => {
-                        if (event === 'close') {
-                            audioStream?.on('end', () => callback(0));
-                        }
-                    },
-                    kill: () => {
-                        deviceManager.stopAudioStream();
-                        if (audioStream && 'destroy' in audioStream) {
-                            (audioStream as any).destroy();
-                        }
+        // Ожидание готовности сервера
+        const startTime = Date.now();
+        const timeoutMs = 10 * 60 * 1000;
+        await new Promise<void>((resolve, reject) => {
+            const tryPing = () => {
+                const req3 = http.get({ hostname: 'localhost', port, path: '/', timeout: 5000 }, (res) => {
+                    if (res.statusCode === 200) resolve(); else { res.resume(); scheduleNext(); }
+                });
+                req3.on('error', scheduleNext);
+                req3.on('timeout', () => { req3.destroy(); scheduleNext(); });
+                function scheduleNext() {
+                    if (Date.now() - startTime > timeoutMs) {
+                        reject(new Error('Таймаут ожидания запуска сервера ZonosJS'));
+                        return;
                     }
-                };
-            } catch (error) {
-                console.error('❌ Ошибка инициализации RtAudio:', error);
-                return 'Ошибка: не удалось инициализировать RtAudio';
+                    setTimeout(tryPing, 3000);
+                }
+            };
+            tryPing();
+        });
+        console.log(`Сервер готов на http://localhost:${port}/`);
+
+        // Импорт клиента ZonosJS и генерация
+        const moduleUrl = 'file:///home/timax/projects/zonosjs-test/node_modules/zonosjs/index.js';
+        const mod = await import(moduleUrl);
+        const ZonosJS = (mod as any).default;
+        const client = new ZonosJS(`http://localhost:${port}`);
+
+        let referencePathToUse: string | null = null;
+        try {
+            if (fs.existsSync(this.defaultReferencePath)) {
+                const stat = fs.statSync(this.defaultReferencePath);
+                if (stat.isFile() && stat.size > 0) referencePathToUse = this.defaultReferencePath;
             }
+        } catch {}
+        if (!referencePathToUse) {
+            console.warn('reference.wav не найден или пуст — генерация без референса. Рекомендуется WAV 10–30 секунд.');
         } else {
-            // Linux: используем arecord
-            try {
-                const recordCommand = deviceManager.getRecordCommand(bestInputDevice, SAMPLE_RATE);
-                console.log(`🔧 Команда записи: ${recordCommand.join(' ')}`);
-                arecord = spawn(recordCommand[0], recordCommand.slice(1));
-            } catch (error) {
-                console.warn('⚠️ Ошибка при получении команды записи, использую fallback:', error);
-                const recordCommand = deviceManager.getRecordCommand(bestInputDevice, SAMPLE_RATE);
-                console.log(`🔧 Используется команда записи: ${recordCommand.join(' ')}`);
-                arecord = spawn(recordCommand[0], recordCommand.slice(1));
-            }
+            console.log(`Используется референсное аудио: ${referencePathToUse}`);
         }
 
-        let commandBuffer: string[] = [];
-        let isListening = false;
-        let lastSpeechTime = Date.now();
-        let isProcessing = false;
-        let currentInputDevice = bestInputDevice;
-        let transcriptionResult = '';
-
-        const vad = createVAD();
-        const utteranceChunks: Buffer[] = [];
-        let queue: Buffer[] = [];
-        let queueActive = false;
-
-        const processQueue = async () => {
-            if (queueActive) return;
-            queueActive = true;
-            try {
-                while (queue.length > 0) {
-                    const buf = queue.shift() as Buffer;
-                    const textRaw = await whisperTranscribe(buf);
-                    const text = (textRaw || '').trim().toLowerCase();
-                    if (!text) continue;
-
-                    console.log(`\n🔍 Распознано (Whisper): "${text}"`);
-                    lastSpeechTime = Date.now();
-
-                    if (!isListening && text.includes(this.name)) {
-                        this.interruptCurrentProcess();
-                        isListening = true;
-                        console.log(`\n🎯 Ключевое слово "${this.name}" обнаружено! Слушаю команду...`);
-                        commandBuffer.push(textRaw.trim());
-                        console.log(`🎤 Команда: ${textRaw.trim()}`);
-                        continue;
-                    }
-
-                    if (isListening && text.includes(this.name) && commandBuffer.length > 0) {
-                        console.log(`\n🔄 Новое обращение "${this.name}" во время команды - перезапускаю...`);
-                        this.interruptCurrentProcess();
-                        commandBuffer = [textRaw.trim()];
-                        console.log(`🎤 Новая команда: ${textRaw.trim()}`);
-                        continue;
-                    }
-
-                    if (isListening) {
-                        const lastBufText = commandBuffer[commandBuffer.length - 1] || '';
-                        const currentText = textRaw.trim();
-                        if (lastBufText && (lastBufText.includes(currentText) || currentText.includes(lastBufText))) {
-                            // пропускаем дубликат
-                        } else {
-                            commandBuffer.push(currentText);
-                            console.log(`🎤 Команда: ${currentText}`);
-                        }
-                    }
-                }
-            } finally {
-                queueActive = false;
-            }
-        };
-
-        const finalizeUtterance = () => {
-            if (utteranceChunks.length === 0) return;
-            const buf = Buffer.concat(utteranceChunks.splice(0));
-            queue.push(buf);
-            void processQueue();
-        };
-
-        vad.on('voice', () => {
-            lastSpeechTime = Date.now();
-        });
-        vad.on('silence', () => {
-            finalizeUtterance();
-        });
-
-        // Проверка тишины для отправки команды
-        const checkSilence = async () => {
-            if (isListening && !isProcessing && (Date.now() - lastSpeechTime) > this.silenceThreshold) {
-                if (commandBuffer.length > 0) {
-                    const fullCommand = commandBuffer.join(' ');
-                    console.log('\n📝 Полная команда:', fullCommand);
-                    transcriptionResult = fullCommand;
-
-                    commandBuffer = [];
-                    isListening = false;
-                    isProcessing = true;
-
-                    try {
-                        await this.ask(fullCommand);
-                    } catch (error) {
-                        if (error instanceof Error && error.message.includes('Прервано пользователем')) {
-                            // молча
-                        } else {
-                            console.error('❌ Ошибка при обработке команды:', error);
-                        }
-                    }
-
-                    isProcessing = false;
-                    console.log('\n👂 Ожидание ключевого слова...');
-                }
-            }
-        };
-
-        // Проверка на изменения устройств (для Bluetooth)
-        const checkDeviceChanges = async () => {
-            if (!isProcessing) {
-                try {
-                    const newBestDevice = await deviceManager.getBestInputDevice();
-                    if (newBestDevice && newBestDevice.id !== currentInputDevice?.id) {
-                        console.log(`\n🔄 Обнаружено новое лучшее устройство: ${newBestDevice.name}`);
-                        console.log('⚠️ Для переключения устройства потребуется перезапуск...');
-                        currentInputDevice = newBestDevice;
-                    }
-                } catch (error) {
-                    console.warn('⚠️ Ошибка при проверке устройств:', error);
-                }
-            }
-        };
-
-        const silenceCheckInterval = setInterval(checkSilence, 100);
-        const deviceCheckInterval = setInterval(checkDeviceChanges, 5000);
-
-        // Подписка на аудио поток
-        arecord.stdout.on('data', (data: Buffer) => {
-            // Кладем в текущую реплику и в VAD
-            utteranceChunks.push(Buffer.from(data));
-            (vad as any).write(data);
-        });
-
-        arecord.stderr.on('data', (data: Buffer) => {
-            console.error(`❌ Ошибка arecord: ${data}`);
-        });
-
-        const cleanup = () => {
-            console.log('\nВыполняю очистку и завершаю работу...');
-            clearInterval(silenceCheckInterval);
-            clearInterval(deviceCheckInterval);
-            try { finalizeUtterance(); } catch {}
-            try { arecord.kill(); } catch {}
-            if (deviceManager.requiresRtAudio()) {
-                deviceManager.stopAudioStream();
-            }
-        };
-
-        process.on('SIGINT', () => {
-            cleanup();
-            process.exit(0);
-        });
-
-        arecord.on('close', (code: number) => {
-            if (code !== 0 && code !== null) {
-                console.log(`arecord процесс завершился с кодом ${code}`);
-            }
-            cleanup();
-        });
-
-        console.log('✅ Микрофон запущен. Говорите... (Для остановки нажмите Ctrl+C)');
-        console.log('👂 Ожидание ключевого слова...');
-
-        // Возвращаем результат транскрибации
-        return transcriptionResult;
-    }
-
-    public async TTS(text: string): Promise<void> {
-        // Создаем AbortController для этой конкретной TTS
-        const ttsAbortController = new AbortController();
-        
-        // Добавляем в очередь
-        const ttsItem = { text, abortController: ttsAbortController };
-        this.ttsQueue.push(ttsItem);
-        
-        // Если TTS не активна, запускаем обработку очереди
-        if (!this.isTTSActive) {
-            await this.processTTSQueue();
+        console.log(`Генерируем речь для текста: "${ttsText}"`);
+        const audioBuffer: Buffer = await client.generateSpeech(ttsText, referencePathToUse, 'ru');
+        if (!audioBuffer || audioBuffer.length < 100) {
+            throw new Error(`Сгенерированный аудиобуфер пуст или слишком мал (${audioBuffer ? audioBuffer.length : 0} байт). Проверьте референсное аудио или логи сервера.`);
         }
-    }
-    
-    public async processTTSQueue(): Promise<void> {
-        if (this.isTTSActive || this.ttsQueue.length === 0) {
-            return;
-        }
-        
-        this.isTTSActive = true;
-        
-        while (this.ttsQueue.length > 0) {
-            // Проверяем глобальное прерывание
-            if (this.currentAbortController?.signal.aborted) {
-                console.log('🛑 Обработка TTS прервана глобально');
-                break;
-            }
-            
-            const ttsItem = this.ttsQueue.shift();
-            if (!ttsItem) continue;
-            
-            this.currentTTS = ttsItem;
-            
-            try {
-                await this.executeTTS(ttsItem.text, ttsItem.abortController);
-            } catch (error) {
-                if (error instanceof Error && (error.message.includes('TTS прервана') || error.name === 'AbortError')) {
-                    // Тихо обрабатываем прерывание TTS - это нормальное поведение
-                } else {
-                    console.error('❌ Ошибка TTS:', error);
-                }
-            }
-            
-            this.currentTTS = undefined;
-            
-            // Если была прервана, тихо очищаем оставшуюся очередь
-            if (ttsItem.abortController.signal.aborted) {
-                this.ttsQueue.forEach(item => item.abortController.abort());
-                this.ttsQueue = [];
-                break;
-            }
-        }
-        
-        this.isTTSActive = false;
-    }
-    
-    public async executeTTS(text: string, abortController: AbortController): Promise<void> {
-        return new Promise((resolve, reject) => {
-            // Проверяем прерывание перед началом
-            if (abortController.signal.aborted) {
-                reject(new Error('TTS прервана до начала'));
-                return;
-            }
-            
-            console.log(`📝 Озвучиваю: "${text}"`);
-            
-            // Имитируем TTS с возможностью прерывания
-            const startTime = Date.now();
-            const duration = Math.min(text.length * 50, 3000); // Примерная длительность
-            
-            const checkInterval = setInterval(() => {
-                if (abortController.signal.aborted) {
-                    clearInterval(checkInterval);
-                    console.log('🛑 TTS прервана во время выполнения');
-                    reject(new Error('TTS прервана'));
-                    return;
-                }
-                
-                if (Date.now() - startTime >= duration) {
-                    clearInterval(checkInterval);
-                    console.log('✅ Озвучка завершена');
-                    resolve();
-                }
-            }, 100);
-            
-            // Обработчик прерывания
-            abortController.signal.addEventListener('abort', () => {
-                clearInterval(checkInterval);
-                reject(new Error('TTS прервана'));
-            });
-        });
+
+        const __filename = fileURLToPath(import.meta.url);
+        const __dirnameLocal = path.dirname(__filename);
+        const outPath = path.resolve(__dirnameLocal, 'output_zonos.wav');
+        fs.writeFileSync(outPath, audioBuffer);
+        console.log(`Аудио сохранено в ${outPath}`);
     }
 }
 
 export default Voice;
 
 
-// Пример создания экземпляра класса Voice
 
-const voice = new Voice(
-    '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',      // apikey
-    'deepseek/deepseek-chat-v3-0324:free',     // model
-    undefined,           // system_prompt
-    'алиса',             // name
-    0.7,                 // temperature
-    512,                 // max_tokens
-    undefined,           // defaultInputDevice
-    undefined,           // defaultOutputDevice
-    [],                  // devices
-    2000                 // silenceThreshold
-);
-voice.initialize()
