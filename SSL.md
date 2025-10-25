@@ -14,7 +14,7 @@ The `SSL` class provides comprehensive SSL certificate management that:
 - Supports both define/undefine patterns for idempotent operations
 - Integrates seamlessly with nginx and CloudFlare DNS management
 
-⚠️ **Important**: This module requires proper environment configuration. Use the assist command to configure required environment variables.
+⚠️ **Important**: This module requires proper environment configuration. Configure via `npx hasyx config` (writes `hasyx.config.json`) and it will regenerate `.env` automatically. Do not edit `.env` manually.
 
 <details>
 <summary>Core Exports (`lib/ssl.ts`)</summary>
@@ -74,50 +74,17 @@ sudo yum install certbot python3-certbot-dns-cloudflare
 pip install certbot-dns-cloudflare
 ```
 
-### Environment Configuration with Assist
+### Configuration via hasyx.config.json (recommended)
 
-⚠️ **Required Setup**: Configure environment variables for SSL management:
-
+Define `dns` and `cloudflare` sections and set `LETSENCRYPT_EMAIL` in `hasyx.config.json` via the configurator:
 ```bash
-npx hasyx assist dns
+npx hasyx config
 ```
+This regenerates `.env` automatically. Do not edit `.env` manually.
 
-This will prompt you to configure:
-- `LETSENCRYPT_EMAIL`: Email address for Let's Encrypt notifications
-- `CLOUDFLARE_API_TOKEN`: API token for DNS-01 challenges (wildcard certificates)
-- `CLOUDFLARE_ZONE_ID`: Zone ID for DNS management
-- Domain configuration for subdomain management
+### Manual Environment Configuration (not recommended)
 
-**Example assist session:**
-```bash
-$ npx hasyx assist dns
-
-🌐 DNS Management Configuration
-===============================
-
-Do you want to configure DNS/SSL/Cloudflare management? (y/n): y
-
-Enter your DNS domain (e.g., example.com): yourdomain.com
-✅ DNS domain set to: yourdomain.com
-
-Enter LetsEncrypt email for SSL certificates: admin@yourdomain.com
-✅ SSL email configuration completed
-
-☁️ Cloudflare Configuration (Required for Wildcard SSL)
-========================================================
-
-Enter Cloudflare API Token: your_api_token_here
-✅ Cloudflare API Token configured
-
-Enter Cloudflare Zone ID: your_zone_id_here
-✅ Cloudflare Zone ID configured
-
-💾 Configuration saved to .env file
-```
-
-### Manual Environment Configuration
-
-Alternatively, set environment variables manually:
+You can set environment variables manually, but typical workflow is to use the configurator. The generated `.env` is authoritative and should not be edited by hand.
 
 ```bash
 # Required for SSL certificate creation
@@ -144,7 +111,7 @@ const ssl = new SSL(); // Automatically uses LETSENCRYPT_EMAIL from env
 
 // Verify configuration
 if (!process.env.LETSENCRYPT_EMAIL) {
-  console.error('LETSENCRYPT_EMAIL not configured. Run: npx hasyx assist dns');
+  console.error('LETSENCRYPT_EMAIL not configured. Configure via hasyx.config.json and regenerate .env');
   process.exit(1);
 }
 
@@ -215,14 +182,14 @@ import { SSL } from 'hasyx';
 
 // Environment variables configuration
 const ssl = new SSL({
-  email: process.env.LETSENCRYPT_EMAIL, // From assist or manual setup
+  email: process.env.LETSENCRYPT_EMAIL, // From config or manual setup
   certbotPath: process.env.CERTBOT_PATH || 'certbot',
   staging: process.env.NODE_ENV !== 'production' // Use staging for development
 });
 
 // Validate configuration
 if (!ssl.defaultEmail) {
-  throw new Error('Email configuration required. Run: npx hasyx assist dns');
+  throw new Error('Email configuration required. Configure via hasyx.config.json and regenerate .env');
 }
 
 console.log(`SSL configured with email: ${ssl.defaultEmail}`);
@@ -579,7 +546,7 @@ try {
     await ssl.define('app.yourdomain.com');
   } else if (error.message.includes('Email is required')) {
     console.log('Set LETSENCRYPT_EMAIL environment variable');
-    console.log('Run: npx hasyx assist dns');
+    console.log('Configure via hasyx.config.json and regenerate .env');
   } else if (error.message.includes('Certbot is not available')) {
     console.log('Install certbot: sudo apt install certbot python3-certbot-nginx');
   } else {
@@ -650,10 +617,7 @@ for (const domain of domains) {
 ### 4. Environment Configuration
 
 ```bash
-# Configure via assist command (recommended)
-npx hasyx assist dns
-
-# Or set manually
+# Configure via hasyx.config.json and regenerate .env, or set manually
 LETSENCRYPT_EMAIL=admin@yourdomain.com
 HASYX_DNS_DOMAIN=yourdomain.com
 ```
@@ -681,10 +645,7 @@ HASYX_DNS_DOMAIN=yourdomain.com
 
 **Email not configured:**
 ```bash
-# Configure via assist (recommended)
-npx hasyx assist dns
-
-# Or set environment variable manually
+# Configure via hasyx.config.json and regenerate .env, or set environment variable manually
 export LETSENCRYPT_EMAIL=admin@yourdomain.com
 ```
 

@@ -5,23 +5,28 @@ import React from 'react';
 // Import all available entity components
 import * as UsersEntity from 'hasyx/components/entities/users';
 import * as AccountsEntity from 'hasyx/components/entities/accounts';
-import * as PaymentProvidersEntity from 'hasyx/components/entities/payments_providers';
-import * as PaymentSubscriptionsEntity from 'hasyx/components/entities/payments_subscriptions';
+import * as GitHubIssuesEntity from 'hasyx/components/entities/github_issues';
+import * as OptionsEntity from 'hasyx/components/entities/options';
 import * as DefaultEntity from 'hasyx/components/entities/default';
 
 interface EntityData {
-  id?: string;
+  id: string;
   __typename?: string;
   [key: string]: any;
 }
 
 interface EntityButtonProps {
-  data: EntityData | string;
+  data: EntityData;
+  [key: string]: any;
+}
+
+interface EntityCytoNodeProps {
+  data: EntityData;
   [key: string]: any;
 }
 
 interface EntityCardProps {
-  data: EntityData | string;
+  data: EntityData;
   onClose?: () => void;
   [key: string]: any;
 }
@@ -30,8 +35,9 @@ interface EntityCardProps {
 const ENTITY_REGISTRY = {
   'users': UsersEntity,
   'accounts': AccountsEntity,
-  'payments_providers': PaymentProvidersEntity,
-  'payments_subscriptions': PaymentSubscriptionsEntity,
+  'issues': GitHubIssuesEntity,
+  'options': OptionsEntity,
+  'default': DefaultEntity,
   // Add more entities here as they are created
   // 'notifications': NotificationsEntity,
   // 'posts': PostsEntity,
@@ -64,8 +70,8 @@ export function Button({ data, ...props }: EntityButtonProps) {
   const typename = entityData?.__typename;
   
   const EntityComponent = getEntityComponent(typename);
-  
-  return <EntityComponent.Button data={data} {...props} />;
+  const Comp: any = (EntityComponent as any).Button;
+  return <Comp data={data as any} {...props} />;
 }
 
 export function Card({ data, onClose, ...props }: EntityCardProps) {
@@ -73,6 +79,15 @@ export function Card({ data, onClose, ...props }: EntityCardProps) {
   const typename = entityData?.__typename;
   
   const EntityComponent = getEntityComponent(typename);
+  const Comp: any = (EntityComponent as any).Card;
+  return <Comp data={data as any} onClose={onClose} {...props} />;
+} 
+
+export function CytoNode({ data, ...props }: EntityCytoNodeProps) {
+  const entityData = typeof data === 'object' ? data : null;
+  const typename = entityData?.__typename;
   
-  return <EntityComponent.Card data={data} onClose={onClose} {...props} />;
+  const EntityComponent = getEntityComponent(typename);
+  const Comp: any = (EntityComponent as any).CytoNode;
+  return <Comp data={data as any} {...props} />;
 } 

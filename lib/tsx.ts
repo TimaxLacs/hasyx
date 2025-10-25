@@ -4,13 +4,14 @@ import * as dotenv from 'dotenv';
 import * as path from 'path';
 import * as fs from 'fs-extra';
 import * as repl from 'repl';
-import { Hasyx } from './hasyx';
-import { createApolloClient } from './apollo';
+import { Hasyx } from './hasyx/hasyx';
+import { createApolloClient } from './apollo/apollo';
 import { Generator } from './generator';
 import { ExecTs } from './exec-tsx';
 import Debug from './debug';
 // Import all exports from index.ts to provide as context
 import * as hasyxLib from './index';
+import jsan from 'jsan';
 
 const debug = Debug('hasyx:tsx');
 
@@ -112,7 +113,7 @@ async function main() {
       path,
     };
     
-    exec = new ExecTs(fullContext);
+    exec = new ExecTs({ initialContext: fullContext });
     
     // Add exec to its own context after creation
     exec.updateContext({ exec });
@@ -130,9 +131,10 @@ async function main() {
     debug(`Executing TypeScript script string: ${evalScript}`);
     try {
       // Execute TypeScript code directly using ExecTs
-      const result = await exec.execTs(evalScript);
-      if (result !== undefined) {
-        console.log('📤 Result:', result);
+      const { result: execResult, logs } = await exec.execTs(evalScript);
+      console.log('📤 Result:', jsan.stringify(execResult, null, 2));
+      if (logs && logs.length) {
+        console.log('📝 Logs:', jsan.stringify(logs, null, 2));
       }
       process.exit(0);
     } catch (error) {
@@ -202,13 +204,26 @@ async function main() {
         let result;
         if (isTypeScript) {
           // Use TypeScript execution for TS code
-          result = await exec.execTs(cleanCmd);
+          const { result: execResult, logs } = await exec.execTs(cleanCmd);
+          if (logs && logs.length) {
+            console.log('📝 Logs:', jsan.stringify(logs, null, 2));
+          }
+          result = execResult;
         } else {
           // Use regular JavaScript execution for plain JS
-          result = await exec.exec(cleanCmd);
+          const { result: execResult, logs } = await exec.exec(cleanCmd);
+          if (logs && logs.length) {
+            console.log('📝 Logs:', jsan.stringify(logs, null, 2));
+          }
+          result = execResult;
         }
         
-        callback(null, result);
+        if (result) {
+          const formatted = jsan.stringify(result, null, 2);
+          callback(null, formatted);
+        } else {
+          callback(null, result);
+        }
       } catch (error) {
         callback(error);
       }

@@ -2,11 +2,14 @@
 
 Authentication Helpers (`AUTH.md`)
 
-This document describes the authentication helper utilities provided in `lib/auth.tsx`, primarily focused on WebSocket authentication and retrieving user tokens from requests.
+This document describes the authentication helper utilities provided in `lib/auth.tsx`, primarily focused on WebSocket authentication and retrieving user tokens from requests. It also outlines the split credentials flow: OTP vs password.
 
 ## Purpose
 
 These utilities integrate with `next-auth` sessions to simplify authenticating users, especially in WebSocket scenarios where standard HTTP header mechanisms aren't directly applicable, and provide a consistent way to get the decoded user token from incoming HTTP requests.
+
+Configuration note:
+- Required environment variables (`NEXTAUTH_SECRET`, `HASURA_JWT_SECRET`, etc.) are auto-generated from `hasyx.config.json`. Use `npx hasyx config` to edit configuration. Do not edit `.env` manually.
 
 <details>
 <summary>Core Exports (`lib/auth.tsx`)</summary>
@@ -22,6 +25,25 @@ These utilities integrate with `next-auth` sessions to simplify authenticating u
 </details>
 
 ## Usage
+### Split Credentials Flow (OTP and Password)
+
+Hasyx splits the Credentials sign-in into two independent parts:
+
+1) OTP sign-in (email/phone)
+- Start code: `POST /api/auth/credentials/start` with `{ provider: 'email'|'phone', identifier }`
+- Verify code: `POST /api/auth/otp/verify` with `{ attemptId, code }`
+- Result: returns `userId`; the client calls `signIn('credentials', { userId })` to establish a stable session
+
+2) Password sign-in (email/phone + password)
+- Unauthenticated sign-in: `signIn('credentials', { providerType: 'email'|'phone', identifier, password })`
+- Password management (authenticated only):
+  - Status: `GET /api/auth/credentials/status?providerType&identifier` → `{ linked, hasPassword }`
+  - Set/change: `POST /api/auth/credentials/set` with `{ providerType, identifier, newPassword, confirmNewPassword, oldPassword? }`
+
+Diagnostics UI (`/hasyx/diagnostics`):
+- `OtpSignInCard` — pure OTP sign-in
+- `CredentialsSignInCard` — password sign-in and password management when authenticated
+
 
 ### `WsClientsManager` (WebSocket Authentication)
 
@@ -33,79 +55,20 @@ This is particularly useful when setting up a WebSocket server (e.g., using `nex
 *   `NEXTAUTH_SECRET` environment variable is set.
 *   A WebSocket server endpoint is set up.
 
-**Example (using `next-ws`):**
+**Example (GraphQL WS via `/api/graphql`):**
 
 ```typescript
-// app/api/ws/route.ts (or similar WebSocket server setup)
-import { NextRequest } from 'next/server';
-import { WsClientsManager } from 'hasyx'; // Adjust path as needed
-import { WebSocket } from 'ws'; // or from your WebSocket library
+// app/api/graphql/route.ts
+import http from 'http';
+import { NextRequest, NextResponse } from 'next/server';
+import { WebSocket, WebSocketServer } from 'ws';
+import { proxyGET, proxyPOST, proxySOCKET, proxyOPTIONS } from 'hasyx/lib/graphql-proxy';
 
-// Initialize the manager (can be done globally or per route)
-const wsManager = WsClientsManager('main-ws');
-
-export async function GET(request: NextRequest) {
-  // This is the standard entry for next-ws
-  // It handles the WebSocket upgrade
-  return new Response(null, { status: 101 }); 
-}
-
-export async function SOCKET(client: WebSocket, request: Request, server: any) {
-  // Add client to the manager and get a unique ID
-  const clientId = wsManager.Client(client);
-  console.log(`Client ${clientId} connected.`);
-
-  try {
-    // Attempt to parse user from the connection request cookies
-    // This uses getToken internally with the cookies from the upgrade request
-    const user = await wsManager.parseUser(request as any, clientId);
-
-    if (user) {
-      console.log(`Client ${clientId} authenticated as user:`, user.id);
-      // Store user data associated with the client if needed
-      // const clientData = wsManager.getClient(clientId);
-      // console.log('Retrieved client data:', clientData);
-
-      // Send confirmation or initial data to the authenticated client
-      client.send(JSON.stringify({ type: 'authenticated', userId: user.id }));
-    } else {
-      console.log(`Client ${clientId} connection is anonymous.`);
-      // Handle anonymous connection or send an authentication required message
-      client.send(JSON.stringify({ type: 'unauthenticated' }));
-      // Optionally close the connection for anonymous users
-      // client.close(1008, 'Authentication required');
-      // wsManager.delete(clientId); // Clean up if closing
-      // return;
-    }
-
-  } catch (error) {
-    console.error(`Error during authentication for client ${clientId}:`, error);
-    client.close(1011, 'Internal server error during authentication');
-    wsManager.delete(clientId); // Clean up on error
-    return;
-  }
-
-  client.on('message', (message) => {
-    console.log(`Received message from ${clientId}: ${message}`);
-    // Handle incoming messages...
-    // You can retrieve the associated user data via wsManager.getClient(clientId).user
-    const clientData = wsManager.getClient(clientId);
-    if (clientData?.user) {
-        console.log(`Message from authenticated user: ${clientData.user.id}`);
-    }
-  });
-
-  client.on('close', () => {
-    console.log(`Client ${clientId} disconnected.`);
-    // Remove client from the manager on disconnect
-    wsManager.delete(clientId);
-  });
-
-  client.on('error', (error) => {
-    console.error(`WebSocket error for client ${clientId}:`, error);
-    // Clean up on error
-    wsManager.delete(clientId);
-  });
+export async function GET(request: NextRequest) { return proxyGET(request); }
+export async function POST(request: NextRequest) { return proxyPOST(request); }
+export async function OPTIONS(request: NextRequest) { return proxyOPTIONS(request); }
+export function SOCKET(client: WebSocket, request: http.IncomingMessage, server: WebSocketServer) {
+  return proxySOCKET(client, request, server);
 }
 ```
 
@@ -186,22 +149,43 @@ The `testAuthorize` function allows developers to:
 
 ```typescript
 import { testAuthorize } from 'hasyx/lib/auth';
+import myCustomSchema from '../path/to/my-custom-schema.json';
 
 // In a test or development script:
 async function testProtectedFeature() {
   // Authenticate as user with ID "user_id_here"
-  const { axios, apollo, hasyx } = await testAuthorize('user_id_here');
+  const { axios, apollo, hasyx } = await testAuthorize(
+    'user_id_here',
+    { 
+      // Optionally pass ApolloClient options and a custom schema
+      schema: myCustomSchema, 
+      ws: false // Example: disable WebSockets for this client
+    }
+  );
   
   // These clients are now authenticated as the specified user
   const response = await axios.get('/api/protected-route');
   console.log('Protected data:', response.data);
   
   // Make GraphQL queries as the authenticated user
-  const result = await apollo.query({
-    query: YOUR_GRAPHQL_QUERY
-  });
+  // The 'hasyx' instance will use myCustomSchema
+  const result = await hasyx.select({ table: 'my_table' });
 }
 ```
+
+**Function Signature:**
+
+```typescript
+testAuthorize(
+  userId: string, 
+  options?: TestAuthorizeOptions
+): Promise<{ axios, apollo, hasyx }>
+```
+
+The optional `options` object (`TestAuthorizeOptions`) extends the `ApolloOptions` from `lib/apollo.tsx` and allows you to pass any valid option for `createApolloClient` (like `url`, `ws`, `headers`, `secret`), plus a `schema` property.
+
+*   `schema`: If provided, the returned `hasyx` instance will be initialized with this schema instead of the default one. This is useful for tests that involve a different or partial GraphQL schema.
+*   Other `ApolloOptions` (e.g., `ws: false`): These are passed directly to the `createApolloClient` function, allowing you to customize the behavior of the returned `apollo` and `hasyx` clients for a specific test.
 
 **How It Works:**
 
@@ -215,6 +199,177 @@ async function testProtectedFeature() {
 * Only enable `TEST_TOKEN` in local development or controlled test environments
 * Never commit `.env` files containing your `TEST_TOKEN` value
 * The functionality has built-in safeguards to prevent production use
+
+## JWT Auth: Local Storage Without Session
+
+JWT authentication mode enables mobile applications (Android/iOS) to authenticate via OAuth providers without relying on traditional client-server sessions. This is essential for client-only builds where session cookies are not available.
+
+### How It Works
+
+1. **Mobile App**: Generates UUID and starts polling for JWT token
+2. **OAuth Flow**: User completes OAuth authentication on web
+3. **JWT Storage**: Token saved to `auth_jwt` table with UUID
+4. **Token Retrieval**: Mobile app receives JWT via UUID polling
+5. **API Access**: Mobile app uses JWT for authenticated requests
+
+### Configuration
+
+Enable in your variant configuration:
+```bash
+npx hasyx config
+# Select variant → Host Configuration → Enable JWT Auth
+```
+
+Or manually in `hasyx.config.json`:
+```json
+{
+  "hosts": {
+    "prod": {
+      "url": "https://hasyx.deep.foundation",
+      "jwtAuth": true
+    }
+  }
+}
+```
+
+**Note**: JWT auth is automatically enabled for client-only builds (`clientOnly: true`) and when explicitly configured (`jwtAuth: true`).
+
+### Automatic JWT Auth for Client Builds
+
+When building client-only applications, JWT auth is automatically enabled:
+
+```bash
+# npm run client automatically enables JWT auth
+npm run client
+
+# npx hasyx client automatically enables JWT auth  
+npx hasyx client
+```
+
+**What happens automatically:**
+- `NEXT_PUBLIC_JWT_AUTH=1` is added to `.env` file
+- JWT authentication system is activated
+- Mobile apps can authenticate via OAuth + JWT flow
+
+This ensures that mobile applications and standalone builds can authenticate without server-side sessions.
+
+### JWT_FORCE: Guaranteed JWT Availability for Serverless
+
+For serverless environments (like Vercel) where WebSocket subscriptions are not available, the `JWT_FORCE` configuration ensures that JWT tokens are always available for direct Hasura GraphQL endpoint access.
+
+**Configuration:**
+```bash
+npx hasyx config
+# Select variant → Host Configuration → Enable JWT Force
+```
+
+Or manually in `hasyx.config.json`:
+```json
+{
+  "hosts": {
+    "prod": {
+      "url": "https://hasyx.deep.foundation",
+      "jwtForce": true
+    }
+  }
+}
+```
+
+**What happens automatically:**
+- `NEXT_PUBLIC_JWT_FORCE=1` is added to `.env` file
+- JWT token is automatically requested from `/api/auth/get-jwt` on app initialization
+- Hasyx client is rebuilt with JWT token for WebSocket support
+- Apollo client uses `NEXT_PUBLIC_HASURA_GRAPHQL_URL` directly for subscriptions
+
+**Benefits:**
+- **WebSocket Support**: Enables real-time subscriptions in serverless environments
+- **Direct Hasura Access**: Bypasses API routes for GraphQL operations
+- **Automatic Token Management**: JWT is retrieved and stored without user intervention
+- **Serverless Compatibility**: Works in Vercel, Netlify, and other serverless platforms
+
+**How it works:**
+1. App starts and checks for `NEXT_PUBLIC_JWT_FORCE=1`
+2. If JWT not in localStorage, automatically requests from `/api/auth/get-jwt`
+3. JWT token is stored and Hasyx client is rebuilt
+4. Apollo client switches to direct Hasura endpoint with WebSocket support
+5. All GraphQL operations (including subscriptions) work via Hasura endpoint
+
+This ensures that even in serverless environments, your application can use WebSocket subscriptions and direct Hasura GraphQL access for optimal performance.
+
+### Client Implementation
+
+The JWT client is available in `components/jwt-auth.tsx`:
+
+```typescript
+import { useJwt } from "hasyx/components/jwt-auth";
+
+// In your component
+const jwtClient = useJwt();
+
+// Generate UUID and start polling
+const jwtId = uuidv4();
+localStorage.setItem('nextauth_jwt_id', jwtId);
+
+jwtClient.id = jwtId;
+jwtClient.start(); // Polls every second
+
+// Handle JWT received
+jwtClient.onDone = (jwt) => {
+  localStorage.setItem('nextauth_jwt', jwt);
+  // Use JWT for API calls
+};
+```
+
+### Using Hasyx JWT Method
+
+For programmatic JWT retrieval, you can use the `.jwt()` method on any Hasyx instance:
+
+```typescript
+import { useHasyx } from 'hasyx';
+
+function MyComponent() {
+  const hasyx = useHasyx();
+  
+  const handleGetJwt = async () => {
+    try {
+      // This will request JWT from /api/auth/get-jwt
+      const token = await hasyx.jwt();
+      console.log('JWT received:', token);
+      
+      // Token is automatically stored and Hasyx client rebuilt
+      // You can now use WebSocket subscriptions
+    } catch (error) {
+      console.error('Failed to get JWT:', error);
+    }
+  };
+  
+  return (
+    <button onClick={handleGetJwt}>
+      Get JWT Token
+    </button>
+  );
+}
+```
+
+**Note:** When using `hasyx.jwt()`, the JWT token is automatically stored in localStorage and the Hasyx client is rebuilt to use the direct Hasura GraphQL endpoint with WebSocket support.
+
+### API Endpoints
+
+- `GET /api/auth_jwt?jwt=<uuid>` - Check JWT status
+- `POST /api/auth/jwt-complete` - Complete JWT authentication
+- `GET /api/auth/jwt-signin` - JWT signin completion page
+
+### Local Storage Keys
+
+- `nextauth_jwt_id` - UUID for JWT polling
+- `nextauth_jwt` - Received JWT token for API calls
+
+### Use Cases
+
+- **Mobile Apps**: Android/iOS applications
+- **Client-Only Builds**: Standalone applications without server
+- **Cross-Platform**: Capacitor, Electron, PWA
+- **OAuth Integration**: Google, GitHub, Telegram, etc.
 
 ## Dependencies
 

@@ -8,6 +8,7 @@ import { SocketAuthStatus } from "./socket-auth-status";
 import { Session } from "next-auth";
 import React from "react";
 import { useHasyx } from "hasyx";
+import { useTranslations } from 'hasyx';
 
 interface SessionCardProps {
   serverSession: Session | null;
@@ -15,21 +16,22 @@ interface SessionCardProps {
 
 function HasyxSessionTab() {
   const hasyx = useHasyx();
+  const t = useTranslations();
   
   return (
     <Card>
       <CardHeader>
-        <CardTitle className="text-lg">Hasyx Session Data</CardTitle>
-        <CardDescription>Session data available through Hasyx instance.</CardDescription>
+        <CardTitle className="text-lg">{t('session.hasyx.title')}</CardTitle>
+        <CardDescription>{t('session.hasyx.description')}</CardDescription>
       </CardHeader>
       <CardContent>
         <div className="space-y-4">
           <div>
-            <p className="text-sm font-medium mb-2">hasyx.userId:</p>
+            <p className="text-sm font-medium mb-2">{t('session.hasyx.userId')}</p>
             <CodeBlock value={hasyx.userId || 'null'} />
           </div>
           <div>
-            <p className="text-sm font-medium mb-2">hasyx.user:</p>
+            <p className="text-sm font-medium mb-2">{t('session.hasyx.user')}</p>
             <CodeBlock value={JSON.stringify(hasyx.user, null, 2)} />
           </div>
         </div>
@@ -39,31 +41,32 @@ function HasyxSessionTab() {
 }
 
 export function SessionCard({ serverSession }: SessionCardProps & React.HTMLAttributes<HTMLDivElement>) {
+  const t = useTranslations();
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Session Data</CardTitle>
-        <CardDescription>View session information from different sources.</CardDescription>
+        <CardTitle>{t('session.title')}</CardTitle>
+        <CardDescription>{t('session.description')}</CardDescription>
       </CardHeader>
       <CardContent>
         <Tabs defaultValue="ssr">
           <TabsList className="grid w-full grid-cols-4">
-            <TabsTrigger value="ssr">SSR</TabsTrigger>
-            <TabsTrigger value="get">GET</TabsTrigger>
-            <TabsTrigger value="socket">Socket</TabsTrigger>
-            <TabsTrigger value="hasyx">Hasyx</TabsTrigger>
+            <TabsTrigger value="ssr">{t('session.tabs.ssr')}</TabsTrigger>
+            <TabsTrigger value="get">{t('session.tabs.get')}</TabsTrigger>
+            <TabsTrigger value="socket">{t('session.tabs.socket')}</TabsTrigger>
+            <TabsTrigger value="hasyx">{t('session.tabs.hasyx')}</TabsTrigger>
           </TabsList>
           <TabsContent value="ssr" className="mt-4">
             <Card>
               <CardHeader>
-                <CardTitle className="text-lg">Server Session Data</CardTitle>
-                <CardDescription>Session data available during Server-Side Rendering.</CardDescription>
+                <CardTitle className="text-lg">{t('session.ssr.title')}</CardTitle>
+                <CardDescription>{t('session.ssr.description')}</CardDescription>
               </CardHeader>
               <CardContent>
                 {serverSession ? (
                   <CodeBlock value={JSON.stringify(serverSession, null, 2)} />
                 ) : (
-                  <p>No session data available on the server.</p>
+                  <p>{t('session.ssr.empty')}</p>
                 )}
               </CardContent>
             </Card>

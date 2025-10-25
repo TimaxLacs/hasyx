@@ -4,13 +4,15 @@ import * as dotenv from 'dotenv';
 import * as path from 'path';
 import * as fs from 'fs-extra';
 import * as repl from 'repl';
-import { Hasyx } from './hasyx';
-import { createApolloClient } from './apollo';
+import { Hasyx } from './hasyx/hasyx';
+import { createApolloClient } from './apollo/apollo';
 import { Generator } from './generator';
 import { Exec } from './exec';
 import Debug from './debug';
 // Import all exports from index.ts to provide as context
 import * as hasyxLib from './index';
+import { generateConsole } from './ai/console';
+import jsan from 'jsan';
 
 const debug = Debug('hasyx:js');
 
@@ -87,9 +89,12 @@ async function main() {
     client = new Hasyx(apolloAdminClient, generator);
     
     // Create execution context with all hasyx exports
+    const dialog = generateConsole();
     const fullContext = {
       // Core instances
       client,
+      hasyx: client,
+      dialog,
       // All hasyx library exports
       ...hasyxLib,
       // Node.js globals
@@ -110,14 +115,15 @@ async function main() {
       path,
     };
     
-    exec = new Exec(fullContext);
+    exec = new Exec({ initialContext: fullContext });
     
     // Add exec to its own context after creation
     exec.updateContext({ exec });
     
-    console.log('✅ Hasyx client initialized with admin privileges.');
+    console.log('✅ Hasyx client (hasyx & client) initialized with admin privileges.');
     console.log('✅ Exec environment initialized with full hasyx context.');
-    console.log('📦 Available in context: client, exec, all hasyx exports, and Node.js globals.');
+    console.log('✅ Console AI Dialog available as `dialog`. Usage: dialog.ask("your question")');
+    console.log('📦 Available in context: hasyx, client, dialog, exec, all hasyx exports, and Node.js globals.');
     debug('Hasyx client and Exec created successfully with full context.');
   } catch (err) {
     console.error('❌ Failed to initialize Hasyx client:', err);
@@ -127,9 +133,10 @@ async function main() {
   if (evalScript) {
     debug(`Executing script string: ${evalScript}`);
     try {
-      const result = await exec.exec(evalScript);
-      if (result !== undefined) {
-        console.log('📤 Result:', result);
+      const { result: execResult, logs } = await exec.exec(evalScript);
+      console.log('📤 Result:', jsan.stringify(execResult, null, 2));
+      if (logs && logs.length) {
+        console.log('📝 Logs:', jsan.stringify(logs, null, 2));
       }
       process.exit(0);
     } catch (error) {
@@ -145,9 +152,10 @@ async function main() {
     }
     try {
       const fileContent = await fs.readFile(fullPath, 'utf-8');
-      const result = await exec.exec(fileContent);
-      if (result !== undefined) {
-        console.log('📤 Result:', result);
+      const { result: execResult, logs } = await exec.exec(fileContent);
+      console.log('📤 Result:', jsan.stringify(execResult, null, 2));
+      if (logs && logs.length) {
+        console.log('📝 Logs:', jsan.stringify(logs, null, 2));
       }
       process.exit(0);
     } catch (error) {
@@ -157,7 +165,7 @@ async function main() {
   } else {
     debug('Starting REPL session.');
     console.log('🟢 Hasyx REPL started.');
-    console.log('📦 Available: client, exec, and all hasyx library exports');
+    console.log('�� Available: client, dialog, exec, and all hasyx library exports');
     console.log('   Type .exit to close.');
     
     const replServer = repl.start({
@@ -181,7 +189,12 @@ async function main() {
         }
         
         const result = await exec.exec(cleanCmd);
-        callback(null, result);
+        if (result) {
+          const formatted = jsan.stringify(result, null, 2);
+          callback(null, formatted);
+        } else {
+          callback(null, result);
+        }
       } catch (error) {
         callback(error);
       }

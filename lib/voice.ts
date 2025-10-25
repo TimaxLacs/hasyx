@@ -3,738 +3,545 @@ import { OpenRouterProvider } from './ai/providers/openrouter';
 import type { AIMessage } from './ai/ai';
 import path from 'path';
 import * as fs from 'fs';
-import { WaveFile as WaveFileOriginal } from 'wavefile';
-import { spawn } from 'child_process';
+import { spawn, spawnSync, ChildProcessWithoutNullStreams } from 'child_process';
 import { fileURLToPath } from 'url';
 import http from 'http';
-import { spawnSync } from 'child_process';
 import AdmZip from 'adm-zip';
+import type { Model, Recognizer } from 'vosk';
 import * as vosk from 'vosk';
-import * as https from 'https';
+import https from 'https';
+import { Dialog, DialogEvent } from './ai/dialog';
+import { AIProvider } from './ai/ai';
+import { ExecJSTool } from './ai/tools/exec-js-tool';
+import { TerminalTool } from './ai/tools/terminal-tool';
+import { createSystemPrompt } from './ai/core-prompts';
+import { Tool } from './ai/tool';
+import chalk from 'chalk';
+
+// ==================================================================================
+// PHASE 1, TASK 1.1: DEFINE INTERFACES AND STATES
+// ==================================================================================
+
+/**
+ * Перечисление состояний голосового ассистента для управления через конечный автомат.
+ */
+export enum VoiceState {
+    IDLE,                  // Ресурсы не захвачены
+    INITIALIZING,          // Идет инициализация
+    LISTENING_FOR_KEYWORD, // Ожидание ключевого слова
+    RECORDING_COMMAND,     // Идет запись команды
+    AWAITING_AI_RESPONSE,  // Ожидание ответа от Dialog
+    SPEAKING,              // Синтез и воспроизведение речи
+    DESTROYING,            // Освобождение ресурсов
+}
+
+/**
+ * Интерфейс для движка распознавания речи (Speech-to-Text).
+ */
+export interface ITranscriber {
+    /** Инициализирует модель и ресурсы. */
+    initialize(): Promise<void>;
+    /** Начинает прослушивание, вызывая колбэк при получении результата. */
+    start(onResult: (text: string) => void): Promise<void>;
+    /** Останавливает текущее прослушивание. */
+    stop(): Promise<void>;
+    /** Освобождает все ресурсы. */
+    destroy(): Promise<void>;
+}
+
+/**
+ * Интерфейс для движка синтеза речи (Text-to-Speech).
+ */
+export interface ITextToSpeech {
+    /** Инициализирует сервер и ресурсы. */
+    initialize(): Promise<void>;
+    /** Синтезирует и воспроизводит речь. */
+    speak(text: string): Promise<void>;
+    /** Прерывает текущее воспроизведение. */
+    stop(): Promise<void>;
+    /** Освобождает все ресурсы. */
+    destroy(): Promise<void>;
+}
+
+// ==================================================================================
+// PHASE 1, TASK 1.3: CREATE DEFAULT IMPLEMENTATION CLASSES
+// ==================================================================================
 
 const DEFAULT_MODEL_STT = 'vosk-model-small-ru-0.22';
 const MODEL_PATH = path.resolve(__dirname, './models', DEFAULT_MODEL_STT);
 const SAMPLE_RATE = 16000;
 
-class Voice {
-    private apikey: string;
-    private model?: string;
-    private temperature?: number;
-    private max_tokens?: number;
-    private system_prompt?: string;
-    private defaultInputDevice: any;
-    private defaultOutputDevice: any;
-    private devices: any[];
-    private name: string;
-    private silenceThreshold: number;
-    private isProcessing: boolean = false;
-    private currentAbortController?: AbortController;
-    private aiProvider?: OpenRouterProvider;
-    
-    // Добавляем поля для управления TTS
-    private ttsQueue: Array<{ text: string; abortController: AbortController }> = [];
-    private currentTTS?: { text: string; abortController: AbortController };
-    private isTTSActive: boolean = false;
+/**
+ * Реализация ITranscriber с использованием Vosk для локального распознавания речи.
+ */
+class VoskTranscriber implements ITranscriber {
+    private audioDeviceManager: AudioDeviceManager;
+    private recognizer?: vosk.Recognizer<any>;
+    private model?: Model;
+    private recordProcess?: ChildProcessWithoutNullStreams | any;
+    private onResultCallback?: (text: string) => void;
 
-    // Восстанавливаем поля для активации по ключевому слову
-    private isListening: boolean = false;
-    private commandBuffer: string[] = [];
-    private lastSpeechTime: number = 0;
-    private lastPartialResult: string = '';
-    private currentInputDevice: any;
-
-    // Фоновый слушатель и ожидатели результатов
-    private listeningStarted: boolean = false;
-    private pendingResolvers: Array<(text: string) => void> = [];
-    private arecordProcess?: any;
-    private audioInputStream?: NodeJS.ReadableStream;
-    private vadInstance?: any;
-    private utteranceChunks: Buffer[] = [];
-    private isAwaitingCommand: boolean = false;
-    private commandParts: string[] = [];
-    private silenceTimer: NodeJS.Timeout | null = null;
-    private zonosProjectDir: string;
-    private defaultReferencePath: string;
-    private resultsQueue: Array<{ id: number; text: string; ts: number }> = [];
-    private lastFinalResult: string = '';
-    private utteranceCounter: number = 0;
-    private resultWatcherInterval?: NodeJS.Timeout;
-
-    // Таймеры для проверки тишины и изменений устройств
-    private silenceCheckInterval?: NodeJS.Timeout;
-    private deviceCheckInterval?: NodeJS.Timeout;
-
-    
-    constructor(
-        apikey?: string, 
-        model?: string, 
-        system_prompt?: string,
-        name: string = 'алиса',
-        temperature?: number, 
-        max_tokens?: number, 
-        defaultInputDevice?: any,
-        defaultOutputDevice?: any,
-        devices?: any[],
-        silenceThreshold: number = 2000,
-
-    ) {
-        this.apikey = apikey || process.env.OPENROUTER_API_KEY || '';
-        this.model = model;
-        this.temperature = temperature;
-        this.max_tokens = max_tokens;
-        
-        this.system_prompt = system_prompt || `You are a voice assistant named "${name}". The user addresses you by this name.
-
-We are working together on this project. When we need to execute code, analyze data, or perform operations, we work as a team.
-
-**Communication Guidelines:**
-- Always use "we" when referring to our work together ("we implemented", "we will try", "we observed", "we succeeded", "we agree", "we made a mistake")
-- Execute code ONLY when calculations, demonstrations, or verification are actually needed
-- For simple questions, conversations, or general knowledge - respond directly without code execution
-- Use proper error handling and provide helpful explanations
-- Keep responses focused and practical
-- Since this is a voice interface, keep responses concise and easy to listen to and hear.
-
-**IMPORTANT CODE EXECUTION RULES:**
-- When you need to execute JavaScript, you MUST use the exact format: > 😈<uuid>/do/exec/js followed by \`\`\`js
-- When you need to execute TypeScript, you MUST use the exact format: > 😈<uuid>/do/exec/tsx followed by \`\`\`tsx
-- When you need to execute terminal commands, you MUST use the exact format: > 😈<uuid>/do/terminal/bash followed by \`\`\`bash
-- NEVER use \`\`\`javascript or \`\`\`typescript or \`\`\`terminal - always use the exact formats above
-- Always generate a unique UUID for each operation (use crypto.randomUUID() pattern)
-- Only execute code when it's actually necessary to answer the question
-
-**Examples:**
-> 😈calc-123e4567-e89b-12d3-a456-426614174000/do/exec/js
-\`\`\`js
-2 + 2
-\`\`\`
-
-> 😈types-123e4567-e89b-12d3-a456-426614174001/do/exec/tsx
-\`\`\`tsx
-interface User { id: number; name: string }
-const user: User = { id: 1, name: "John" };
-user
-\`\`\`
-
-> 😈cmd-123e4567-e89b-12d3-a456-426614174002/do/terminal/bash
-\`\`\`bash
-echo "Hello World"
-\`\`\`
-
-**Voice Interface Rules:**
-- The user will not see all of your text that you write.
-- The user will only hear your text in this format: <VOICE>TEXT_FOR_VOICE</VOICE>
-- Your answer in this format should be concise, understandable, and easy to listen to and hear.
-
-**Important:** Don't separate yourself from the user - we are working together as a team. Only execute code when it's actually necessary to answer the question.`;
-        
-        this.defaultInputDevice = defaultInputDevice;
-        this.defaultOutputDevice = defaultOutputDevice;
-        this.devices = devices || [];
-        this.name = name.toLowerCase();
-        this.silenceThreshold = silenceThreshold;
-        this.zonosProjectDir = '/home/timax/projects/zonosjs-test';
-        this.defaultReferencePath = '/home/timax/projects/zonosjs-test/reference.wav';
+    constructor() {
+        this.audioDeviceManager = new AudioDeviceManager();
     }
 
-    public async initialize(): Promise<void> {
-        try {
-            await this.device();
-            void this.transcribe();
-            
-            // Обработчик результатов только для команд, прошедших через активацию
-            if (this.resultWatcherInterval) clearInterval(this.resultWatcherInterval);
-            this.resultWatcherInterval = setInterval(async () => {
-                while (this.resultsQueue.length > 0) {
-                    const item = this.resultsQueue.shift();
-                    if (!item) break;
-                    
-                    console.log('🔔 Обрабатываю команду:', item.text);
-                    try {
-                        const resultAsk = await this.ask(item.text);
-                        console.log('🔔 Ответ нейросети:', resultAsk);
-                    } catch (error) {
-                        if (error instanceof Error && error.message.includes('Прервано пользователем')) {
-                            console.log('🛑 Команда прервана пользователем');
-                        } else {
-                            console.error('❌ Ошибка при обработке команды:', error);
-                        }
-                    }
-                }
-            }, 100);
-        } catch (error) {
-            console.error('❌ Ошибка при инициализации:', error);
-        }
-    }
-
-    public async initializeProvider(): Promise<void> {
-        const token = this.apikey || process.env.OPENROUTER_API_KEY || '';
-        if (!token) {
-            throw new Error('OPENROUTER_API_KEY отсутствует. Установите переменную окружения или передайте ключ в конструктор Voice.');
-        }
-        this.aiProvider = new OpenRouterProvider({
-            token,
-            model: this.model || 'deepseek/deepseek-chat-v3-0324:free',
-            temperature: this.temperature ?? 0.7,
-            max_tokens: this.max_tokens,
-            timeout: 120000
-        });
-    }
-
-    public interruptCurrentProcess(): void {
-        console.log('🛑 Прерываю все текущие процессы...');
-        
-        // Отменяем генерацию ИИ
-        if (this.currentAbortController) {
-            this.currentAbortController.abort();
-        }
-        
-        // Прерываем текущую TTS
-        if (this.currentTTS) {
-            this.currentTTS.abortController.abort();
-            this.currentTTS = undefined;
-        }
-        
-        // Очищаем очередь TTS
-        if (this.ttsQueue.length > 0) {
-            this.ttsQueue.forEach(tts => tts.abortController.abort());
-            this.ttsQueue = [];
-        }
-        
-        this.isProcessing = false;
-        this.isTTSActive = false;
-    }
-
-    public async device(inputDevice?: any, outputDevice?: any): Promise<void> {
-        const manager = new AudioDeviceManager();
-        await manager.initialize();
-        
-        const { defaultInputDevice, defaultOutputDevice } = manager.findDefaultDevices(inputDevice, outputDevice);
-        const devices = manager.getDevices();
-        
-        this.defaultInputDevice = defaultInputDevice;
-        this.defaultOutputDevice = defaultOutputDevice;
-        this.devices = devices;
-
-        console.log('Найдены устройства:');
-        console.log('Микрофон:', this.defaultInputDevice?.name || 'не найден');
-        console.log('Динамики:', this.defaultOutputDevice?.name || 'не найдены');
-    }
-
-
-    public async transcribe(): Promise<void> {
-        console.log('🎤 Запуск транскрибатора (микрофон + Vosk)...');
+    async initialize(): Promise<void> {
+        await this.audioDeviceManager.initialize();
         if (!fs.existsSync(MODEL_PATH)) {
-            console.log('ℹ️ Модель отсутствует, запускаю установку...');
-            const modelUrl = 'https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip';
-            const zipPath = path.resolve(__dirname, './models/vosk-model.zip');
-
-            if (fs.existsSync(zipPath)) {
-                try { fs.unlinkSync(zipPath); } catch {}
-            }
-
-            console.log('⏳ Начинаю загрузку модели...');
-            console.log(`📥 Загрузка модели с ${modelUrl}`);
-            await new Promise<void>((resolve, reject) => {
-                const file = fs.createWriteStream(zipPath);
-                let downloadedBytes = 0;
-                let totalBytes = 0;
-
-                https.get(modelUrl, (response) => {
-                    totalBytes = parseInt(response.headers['content-length'] || '0', 10);
-                    console.log(`📦 Общий размер файла: ${(totalBytes / 1024 / 1024).toFixed(2)}MB`);
-                    response.on('data', (chunk) => {
-                        downloadedBytes += chunk.length;
-                        const progress = (downloadedBytes / totalBytes * 100).toFixed(2);
-                        process.stdout.write(`\r📥 Загрузка: ${progress}% (${(downloadedBytes / 1024 / 1024).toFixed(2)}MB)`);
-                    });
-                    response.on('end', () => {
-                        process.stdout.write('\n');
-                        file.end();
-                    });
-                    response.pipe(file);
-                    file.on('finish', () => {
-                        file.close();
-                        console.log('✅ Загрузка модели завершена.');
-                        resolve();
-                    });
-                }).on('error', (err) => {
-                    fs.unlink(zipPath, () => {});
-                    console.error('❌ Ошибка при загрузке модели:', err);
-                    reject(err);
-                });
-            });
-
-            try {
-                console.log('📦 Начинаю распаковку модели...');
-                const zip = new AdmZip(zipPath);
-                const zipEntries = zip.getEntries();
-                const rootDir = zipEntries[0].entryName.split('/')[0];
-                console.log(`📂 Распаковка ${zipEntries.length} файлов...`);
-                const modelsDir = path.resolve(__dirname, './models');
-                if (!fs.existsSync(modelsDir)) {
-                    fs.mkdirSync(modelsDir, { recursive: true });
-                }
-                zip.extractAllTo(modelsDir, true);
-                console.log(`📂 Распаковка завершена: ${zipEntries.length} файлов`);
-                fs.renameSync(path.resolve(modelsDir, rootDir), MODEL_PATH);
-                console.log('✅ Базовая модель успешно установлена.');
-            } catch (err) {
-                console.error('❌ Ошибка при установке модели:', err);
-                throw err;
-            } finally {
-                const zipPath = path.resolve(__dirname, './models/vosk-model.zip');
-                if (fs.existsSync(MODEL_PATH) && fs.existsSync(zipPath)) {
-                    try { fs.unlinkSync(zipPath); } catch {}
-                    console.log('🗑️ Временный zip-файл удален.');
-                }
-            }
+            await this.downloadModel();
         }
-
-        // Инициализация Vosk
         vosk.setLogLevel(-1);
-        const model = new vosk.Model(MODEL_PATH);
-        const recognizer = new vosk.Recognizer({ model: model, sampleRate: SAMPLE_RATE });
-
-        // Запуск устройства захвата звука
-        const deviceManager = new AudioDeviceManager();
-        await deviceManager.initialize();
-        let selectedInputDevice = this.defaultInputDevice;
+        this.model = new vosk.Model(MODEL_PATH);
+        this.recognizer = new vosk.Recognizer({ model: this.model, sampleRate: SAMPLE_RATE });
+    }
+    
+    async start(onResult: (text: string) => void): Promise<void> {
+        this.onResultCallback = onResult;
+        
+        let selectedInputDevice = await this.audioDeviceManager.getBestInputDevice();
         if (!selectedInputDevice) {
-            selectedInputDevice = await deviceManager.getBestInputDevice();
-        }
-        if (!selectedInputDevice) {
-            console.error('❌ Не удалось определить устройство ввода. Выход.');
-            try { recognizer.free(); } catch {}
-            try { model.free(); } catch {}
-            return;
+            throw new Error("Не удалось определить устройство ввода.");
         }
         
-        // Инициализируем текущее устройство для отслеживания изменений
-        this.currentInputDevice = selectedInputDevice;
         console.log(`🎧 Использую устройство ввода: ${selectedInputDevice.name} (ID: ${selectedInputDevice.id})`);
 
-        let arecord: any;
-        let audioStream: NodeJS.ReadableStream | null = null;
-        if (deviceManager.requiresRtAudio()) {
-            try {
-                console.log('🔧 Использую RtAudio для Windows/macOS');
-                audioStream = await deviceManager.recordAudioStream(selectedInputDevice, SAMPLE_RATE, 1);
-                arecord = {
+        if (this.audioDeviceManager.requiresRtAudio()) {
+            const audioStream = await this.audioDeviceManager.recordAudioStream(selectedInputDevice, SAMPLE_RATE, 1);
+            this.recordProcess = {
                     stdout: audioStream,
                     stderr: { on: () => {} },
                     on: (event: string, callback: Function) => {
-                        if (event === 'close') {
-                            audioStream?.on('end', () => callback(0));
-                        }
-                    },
-                    kill: () => {
-                        deviceManager.stopAudioStream();
-                        if (audioStream && 'destroy' in audioStream) {
-                            (audioStream as any).destroy();
-                        }
-                    }
-                };
-            } catch (error) {
-                console.error('❌ Ошибка инициализации RtAudio:', error);
-                try { recognizer.free(); } catch {}
-                try { model.free(); } catch {}
-                return;
-            }
+                    if (event === 'close') audioStream?.on('end', () => callback(0));
+                },
+                kill: () => this.audioDeviceManager.stopAudioStream(),
+            };
         } else {
-            try {
-                const recordCommand = deviceManager.getRecordCommand(selectedInputDevice, SAMPLE_RATE);
-                console.log(`🔧 Команда записи: ${recordCommand.join(' ')}`);
-                arecord = spawn(recordCommand[0], recordCommand.slice(1));
-            } catch (error) {
-                console.warn('⚠️ Ошибка при получении команды записи, использую fallback:', error);
-                const recordCommand = deviceManager.getRecordCommand(selectedInputDevice, SAMPLE_RATE);
-                console.log(`🔧 Используется команда записи: ${recordCommand.join(' ')}`);
-                arecord = spawn(recordCommand[0], recordCommand.slice(1));
-            }
+            const recordCommand = this.audioDeviceManager.getRecordCommand(selectedInputDevice, SAMPLE_RATE);
+            this.recordProcess = spawn(recordCommand[0], recordCommand.slice(1));
         }
 
-        // Обработка аудиопотока: активация по ключевому слову и сбор команды
-        arecord.stdout.on('data', (data) => {
-            try {
-                if (recognizer.acceptWaveform(data)) {
-                    const result = recognizer.result();
+        this.recordProcess.stdout.on('data', (data: Buffer) => {
+            if (this.recognizer?.acceptWaveform(data)) {
+                const result = this.recognizer.result();
                     if (result && result.text) {
-                        const text = result.text.toLowerCase();
-                        console.log(`🟩 Итог: ${result.text}`);
-                        this.lastSpeechTime = Date.now();
-
-                        // Проверяем активацию по ключевому слову
-                        if (!this.isListening && text.includes(this.name)) {
-                            // МГНОВЕННО прерываем все текущие процессы при активации
-                            this.interruptCurrentProcess();
-                            
-                            this.isListening = true;
-                            console.log(`\n🎯 Ключевое слово "${this.name}" обнаружено! Слушаю команду...`);
-                            this.commandBuffer.push(result.text);
-                            console.log(`🎤 Команда: ${result.text}`);
-                            this.lastPartialResult = '';
-                            return;
-                        }
-                        
-                        // Также проверяем прерывание во время слушания команды
-                        if (this.isListening && text.includes(this.name) && this.commandBuffer.length > 0) {
-                            // Если во время слушания команды снова услышали имя - начинаем новую команду
-                            console.log(`\n🔄 Новое обращение "${this.name}" во время команды - перезапускаю...`);
-                            this.interruptCurrentProcess();
-                            this.commandBuffer = [result.text];
-                            console.log(`🎤 Новая команда: ${result.text}`);
-                            this.lastPartialResult = '';
-                            return;
-                        }
-
-                        if (this.isListening) {
-                            const lastBuffer = this.commandBuffer[this.commandBuffer.length - 1] || '';
-                            if (!lastBuffer.includes(text) && !text.includes(lastBuffer)) {
-                                this.commandBuffer.push(result.text);
-                                console.log(`🎤 Команда: ${result.text}`);
-                            }
-                            this.lastPartialResult = '';
-                        }
-                    }
-                } else {
-                    const partialResult = recognizer.partialResult();
-                    if (partialResult.partial) {
-                        const partialText = partialResult.partial.toLowerCase();
-                        
-                        // Проверяем прерывание даже в частичных результатах для быстрого реагирования
-                        if (partialText.includes(this.name)) {
-                            // Если услышали имя в частичном результате во время обработки - прерываем
-                            if (this.isProcessing || this.isTTSActive) {
-                                console.log(`\n⚡ Быстрое прерывание по частичному результату: "${partialText}"`);
-                                this.interruptCurrentProcess();
-                            }
-                        }
-                        
-                        if (this.isListening && partialResult.partial !== this.lastPartialResult) {
-                            console.log(`🎤 Команда: ${partialResult.partial}`);
-                            this.lastPartialResult = partialResult.partial;
-                        }
-                    }
+                    this.onResultCallback?.(result.text);
                 }
-            } catch (e) {
-                console.error('❌ Ошибка распознавания:', e);
+            } else {
+                const partialResult = this.recognizer?.partialResult();
+                // Optionally handle partial results if needed
             }
         });
 
-        arecord.stderr.on('data', (data) => {
-            console.error(`❌ Ошибка arecord: ${data}`);
+        this.recordProcess.stderr.on('data', (data: Buffer) => {
+            console.error(`❌ Ошибка aplay/arecord: ${data}`);
         });
 
-        const cleanup = () => {
-            console.log('\nВыполняю очистку и завершаю работу...');
-            
-            // Очищаем все таймеры
-            if (this.silenceCheckInterval) {
-                clearInterval(this.silenceCheckInterval);
-                this.silenceCheckInterval = undefined;
+        this.recordProcess.on('close', (code: number) => {
+            if (code !== 0 && code !== null) {
+                console.warn(`Процесс записи завершился с кодом ${code}`);
             }
-            if (this.deviceCheckInterval) {
-                clearInterval(this.deviceCheckInterval);
-                this.deviceCheckInterval = undefined;
-            }
-            if (this.resultWatcherInterval) {
-                clearInterval(this.resultWatcherInterval);
-                this.resultWatcherInterval = undefined;
-            }
-            
-            // Сбрасываем состояние
-            this.isListening = false;
-            this.commandBuffer = [];
-            this.isProcessing = false;
-            
-            arecord.kill();
-            if (deviceManager.requiresRtAudio()) {
-                deviceManager.stopAudioStream();
-            }
-            try { recognizer.free(); } catch {}
-            try { model.free(); } catch {}
-        };
-        
-        process.on('SIGINT', () => {
-            cleanup();
-            process.exit(0);
         });
-        
-        arecord.on('close', (code) => {
-            if (code !== 0 && code !== null) { 
-                 console.log(`arecord процесс завершился с кодом ${code}`);
-            }
-            cleanup();
-        });
+    }
+
+    async stop(): Promise<void> {
+        this.recordProcess?.kill();
+        this.recordProcess = undefined;
+    }
+
+    async destroy(): Promise<void> {
+        await this.stop();
+        this.recognizer?.free();
+        this.model?.free();
+    }
     
-        // Логика проверки тишины и завершения команды
-        const checkSilence = async () => {
-            if (this.isListening && !this.isProcessing && (Date.now() - this.lastSpeechTime) > this.silenceThreshold) {
-                if (this.commandBuffer.length > 0) {
-                    const fullCommand = this.commandBuffer.join(' ');
-                    console.log('\n📝 Полная команда:', fullCommand);
-                    
-                    // Сброс до отправки
-                    this.commandBuffer = [];
-                    this.isListening = false;
-                    this.isProcessing = true;
-                    
-                    try {
-                        // Добавляем команду в очередь результатов для обработки
-                        this.resultsQueue.push({ 
-                            id: ++this.utteranceCounter, 
-                            text: fullCommand, 
-                            ts: Date.now() 
-                        });
-                        console.log('✅ Команда добавлена в очередь для обработки');
-                    } catch (error) {
-                        console.error('❌ Ошибка при добавлении команды в очередь:', error);
-                    }
-                    
-                    this.isProcessing = false;
-                    console.log('\n👂 Ожидание ключевого слова...');
-                }
-            }
-        };
+    private async downloadModel(): Promise<void> {
+        console.log('ℹ️ Модель отсутствует, запускаю установку...');
+        const modelUrl = `https://alphacephei.com/vosk/models/${DEFAULT_MODEL_STT}.zip`;
+        const zipPath = path.resolve(__dirname, './models/vosk-model.zip');
+        const modelsDir = path.resolve(__dirname, './models');
+        if (!fs.existsSync(modelsDir)) fs.mkdirSync(modelsDir, { recursive: true });
 
-        // Проверка на изменения устройств (для Bluetooth)
-        const checkDeviceChanges = async () => {
-            if (!this.isProcessing) {
-                try {
-                    const newBestDevice = await deviceManager.getBestInputDevice();
-                    if (newBestDevice && newBestDevice.id !== this.currentInputDevice?.id) {
-                        console.log(`\n🔄 Обнаружено новое лучшее устройство: ${newBestDevice.name}`);
-                        console.log('⚠️ Для переключения устройства потребуется перезапуск...');
-                        this.currentInputDevice = newBestDevice;
-                    }
-                } catch (error) {
-                    console.warn('⚠️ Ошибка при проверке устройств:', error);
-                }
-            }
-        };
+        await new Promise<void>((resolve, reject) => {
+            https.get(modelUrl, (response) => {
+                const file = fs.createWriteStream(zipPath);
+                response.pipe(file);
+                file.on('finish', () => { file.close(); resolve(); });
+            }).on('error', reject);
+        });
 
-        // Запускаем таймеры проверки
-        this.silenceCheckInterval = setInterval(checkSilence, 100);
-        this.deviceCheckInterval = setInterval(checkDeviceChanges, 5000); // Проверяем каждые 5 секунд
+        const zip = new AdmZip(zipPath);
+        zip.extractAllTo(modelsDir, true);
+        fs.unlinkSync(zipPath);
+        console.log('✅ Модель успешно установлена.');
+    }
+}
 
-        console.log('✅ Микрофон запущен. Говорите... (Ctrl+C для остановки)');
-        console.log('👂 Ожидание ключевого слова...');
+/**
+ * Реализация ITextToSpeech с использованием ZonosJS для локального синтеза речи.
+ */
+class ZonosTTSEngine implements ITextToSpeech {
+    private audioDeviceManager: AudioDeviceManager;
+    private serverProcess?: ChildProcessWithoutNullStreams;
+    private readonly port = 5000;
+    private readonly projectDir: string = '/home/timax/projects/zonosjs-test';
+    private readonly referenceAudio: string = path.join(this.projectDir, 'reference.wav');
+
+    constructor(audioDeviceManager: AudioDeviceManager) {
+        this.audioDeviceManager = audioDeviceManager;
     }
 
-    public async ask(command: string): Promise<string> {
-        // Прерываем предыдущий процесс
-        this.interruptCurrentProcess();
-        
-        this.isProcessing = true;
-        this.currentAbortController = new AbortController();
-        
-        try {
-            
-            console.log('\n🤖 Отправляю запрос к нейросети...');
-            
-            let fullResponse = '';
-            let currentVoiceText = '';
-            let isInsideVoiceTag = false;
-            
-            // Инициализируем провайдера при первом вызове
-            if (!this.aiProvider) {
-                await this.initializeProvider();
-            }
-
-            // Формируем сообщения для модели
-            const messages: AIMessage[] = [];
-            if (this.system_prompt) {
-                messages.push({ role: 'system', content: this.system_prompt });
-            }
-            messages.push({ role: 'user', content: command });
-
-            // Получаем поток строки от провайдера
-            const stream = await this.aiProvider!.stream(messages);
-            
-            // Функция для разбиения текста на предложения
-            const splitIntoSentences = (text: string): string[] => {
-                return text.split(/(?<=[.!?])\s+/).filter(s => s.trim().length > 0);
-            };
-
-            // Функция для обработки накопленного текста
-            const processAccumulatedText = async (text: string) => {
-                // Проверяем прерывание перед TTS
-                if (this.currentAbortController?.signal.aborted) return;
-                
-                const sentences = splitIntoSentences(text);
-                for (const sentence of sentences) {
-                    if (sentence.trim() && !this.currentAbortController?.signal.aborted) {
-                        await this.TTS(sentence.trim());
-                    }
-                }
-            };
-            
-            return new Promise((resolve, reject) => {
-                const reader = stream.getReader();
-                const readNext = async (): Promise<void> => {
-                    try {
-                        if (this.currentAbortController?.signal.aborted) {
-                            reject(new Error('Прервано пользователем'));
-                            return;
-                        }
-                        const { done, value } = await reader.read();
-                        if (done) {
-                            if (currentVoiceText.trim() && !this.currentAbortController?.signal.aborted) {
-                                await processAccumulatedText(currentVoiceText);
-                            }
-                            console.log('\n✅ Ответ нейросети получен');
-                            resolve(fullResponse);
-                            return;
-                        }
-                        const chunk = value as string;
-                        process.stdout.write(chunk);
-                        fullResponse += chunk;
-                        for (let i = 0; i < chunk.length; i++) {
-                            const char = chunk[i];
-                            if (chunk.slice(i, i + 7) === '<VOICE>') { isInsideVoiceTag = true; i += 6; continue; }
-                            if (chunk.slice(i, i + 8) === '</VOICE>') {
-                                isInsideVoiceTag = false; i += 7;
-                                if (currentVoiceText.trim()) {
-                                    await processAccumulatedText(currentVoiceText);
-                                    currentVoiceText = '';
-                                }
-                                continue;
-                            }
-                            if (isInsideVoiceTag) {
-                                currentVoiceText += char;
-                                if (['.', '!', '?'].includes(char)) {
-                                    const sentences = splitIntoSentences(currentVoiceText);
-                                    if (sentences.length > 1) {
-                                        for (let j = 0; j < sentences.length - 1; j++) {
-                                            if (!this.currentAbortController?.signal.aborted) {
-                                                await this.TTS(sentences[j].trim());
-                                            }
-                                        }
-                                        currentVoiceText = sentences[sentences.length - 1];
-                                    }
-                                }
-                            }
-                        }
-                        await readNext();
-                    } catch (error: any) {
-                        if (error.message && error.message.includes('Прервано пользователем')) {
-                            reject(error);
-                        } else {
-                            console.error('\n❌ Ошибка при получении ответа:', error);
-                            reject(error);
-                        }
-                    }
-                };
-                void readNext();
-            });
-        } catch (error) {
-            console.error('❌ Ошибка при обращении к нейросети:', error);
-            return 'Произошла ошибка при обращении к нейросети';
-        } finally {
-            this.isProcessing = false;
+    async initialize(): Promise<void> {
+        const isUp = await this.isServerUp();
+        if (isUp) {
+            console.log(`Обнаружен уже запущенный zonosjs на порту ${this.port} — перезапускаю.`);
+            try { spawnSync('fuser', ['-k', `${this.port}/tcp`], { stdio: 'ignore' }); } catch {}
         }
+
+        const localBin = path.join(this.projectDir, 'node_modules', '.bin', 'zonosjs');
+        this.serverProcess = spawn(localBin, ['serve', '--port', this.port.toString()], {
+            cwd: this.projectDir,
+        });
+
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error('Таймаут ожидания запуска сервера ZonosJS')), 60000);
+            
+            const tryPing = () => {
+                http.get(`http://localhost:${this.port}`, (res) => {
+                    if (res.statusCode === 200) {
+                        clearTimeout(timer);
+                        console.log(`✅ Сервер ZonosJS готов на http://localhost:${this.port}/`);
+                        resolve();
+                    }
+                }).on('error', () => setTimeout(tryPing, 1000));
+            };
+            
+            tryPing();
+        });
+    }
+    
+    async speak(text: string): Promise<void> {
+        const moduleUrl = path.join(this.projectDir, 'node_modules/zonosjs/index.js').replace(/\\/g, '/');
+        const { default: ZonosJS } = await import(`file://${moduleUrl}`);
+        const client = new ZonosJS(`http://localhost:${this.port}`);
+        
+        console.log(`Генерируем речь для текста: "${text}"`);
+        const audioBuffer: Buffer = await client.generateSpeech(text, this.referenceAudio, 'ru');
+        
+        await this.audioDeviceManager.playAudio(audioBuffer);
     }
 
+    async stop(): Promise<void> {
+        // TODO: Implement playback interruption in AudioDeviceManager
+    }
 
+    async destroy(): Promise<void> {
+        this.serverProcess?.kill();
+        this.serverProcess = undefined;
+    }
 
-    public async TTS(text?: string): Promise<void> {
-        const ttsText = text?.trim().length ? text.trim() : 'Привет мир.';
-        const port = 5000;
-
-        // Если сервер уже доступен — перезапускаем
-        const isUp = await new Promise<boolean>((resolve) => {
-            const req = http.get({ hostname: 'localhost', port, path: '/', timeout: 2000 }, (res) => {
-                resolve(res.statusCode === 200);
-            });
+    private isServerUp(): Promise<boolean> {
+        return new Promise((resolve) => {
+            const req = http.get({ hostname: 'localhost', port: this.port, path: '/', timeout: 1000 });
+            req.on('response', () => resolve(true));
             req.on('error', () => resolve(false));
             req.on('timeout', () => { req.destroy(); resolve(false); });
         });
-        if (isUp) {
-            console.log(`Обнаружен уже запущенный zonosjs на http://localhost:${port}/ — перезапускаю.`);
-            try { spawnSync('fuser', ['-k', `${port}/tcp`], { stdio: 'ignore' }); } catch {}
-            try { spawnSync('bash', ['-lc', `lsof -ti :${port} | xargs -r kill -9`], { stdio: 'ignore' }); } catch {}
-            const downStart = Date.now();
-            while (Date.now() - downStart < 60_000) {
-                const stillUp = await new Promise<boolean>((resolve) => {
-                    const req2 = http.get({ hostname: 'localhost', port, path: '/', timeout: 1000 }, (res) => {
-                        res.resume();
-                        resolve(true);
-                    });
-                    req2.on('error', () => resolve(false));
-                    req2.on('timeout', () => { req2.destroy(); resolve(true); });
-                });
-                if (!stillUp) break;
-                await new Promise(r => setTimeout(r, 500));
-            }
-        }
+    }
+}
 
-        // Запуск сервера
-        const localBin = path.join(this.zonosProjectDir, 'node_modules', '.bin', 'zonosjs');
-        console.log(`Запуск сервера zonosjs на порту: ${port}...`);
-        const server = spawn(localBin, ['serve', '--port', port.toString()], {
-            stdio: ['pipe', 'pipe', 'pipe'],
-            cwd: this.zonosProjectDir
-        });
-        server.stdout.on('data', (data: Buffer) => console.log(`[${new Date().toISOString()}] STDOUT: ${data.toString()}`));
-        server.stderr.on('data', (data: Buffer) => console.error(`[${new Date().toISOString()}] STDERR: ${data.toString()}`));
+// ==================================================================================
+// PHASE 1, TASK 1.2 & 1.4: REFACTOR VOICE CLASS
+// ==================================================================================
 
-        // Ожидание готовности сервера
-        const startTime = Date.now();
-        const timeoutMs = 10 * 60 * 1000;
-        await new Promise<void>((resolve, reject) => {
-            const tryPing = () => {
-                const req3 = http.get({ hostname: 'localhost', port, path: '/', timeout: 5000 }, (res) => {
-                    if (res.statusCode === 200) resolve(); else { res.resume(); scheduleNext(); }
-                });
-                req3.on('error', scheduleNext);
-                req3.on('timeout', () => { req3.destroy(); scheduleNext(); });
-                function scheduleNext() {
-                    if (Date.now() - startTime > timeoutMs) {
-                        reject(new Error('Таймаут ожидания запуска сервера ZonosJS'));
-                        return;
-                    }
-                    setTimeout(tryPing, 3000);
-                }
-            };
-            tryPing();
-        });
-        console.log(`Сервер готов на http://localhost:${port}/`);
+/**
+ * Опции для конфигурации экземпляра Voice.
+ */
+interface VoiceOptions {
+    /** API ключ для провайдера нейросети (например, OpenRouter). */
+    apikey?: string;
+    /** Идентификатор модели нейросети. */
+    model?: string;
+    /** Системный промпт для AI. */
+    system_prompt?: string;
+    /** Имя-активатор для ассистента. */
+    name?: string;
+    /** Порог тишины в миллисекундах для определения конца команды. */
+    silenceThreshold?: number;
+    /** Кастомная реализация движка распознавания речи. */
+    transcriber?: ITranscriber;
+    /** Кастомная реализация движка синтеза речи. */
+    tts?: ITextToSpeech;
+    /** Включить ли функцию распознавания речи. По умолчанию true. */
+    enableTranscription?: boolean;
+    /** Включить ли функцию синтеза речи. По умолчанию true. */
+    enableTTS?: boolean;
+    /** Использовать ли второй AI для генерации кратких ответов. По умолчанию false. */
+    useAnnouncerAI?: boolean;
+}
 
-        // Импорт клиента ZonosJS и генерация
-        const moduleUrl = 'file:///home/timax/projects/zonosjs-test/node_modules/zonosjs/index.js';
-        const mod = await import(moduleUrl);
-        const ZonosJS = (mod as any).default;
-        const client = new ZonosJS(`http://localhost:${port}`);
+/**
+ * Главный класс голосового ассистента.
+ * Управляет жизненным циклом, взаимодействием с AI, STT и TTS.
+ */
+class Voice {
+    private state: VoiceState = VoiceState.IDLE;
+    private options: VoiceOptions;
+    private transcriber: ITranscriber;
+    private tts: ITextToSpeech;
+    private audioDeviceManager: AudioDeviceManager;
+    private dialog?: Dialog;
+    private aiProvider?: AIProvider;
+    private commandBuffer: string[] = [];
+    private lastSpeechTime: number = 0;
+    private silenceCheckInterval?: NodeJS.Timeout;
 
-        let referencePathToUse: string | null = null;
-        try {
-            if (fs.existsSync(this.defaultReferencePath)) {
-                const stat = fs.statSync(this.defaultReferencePath);
-                if (stat.isFile() && stat.size > 0) referencePathToUse = this.defaultReferencePath;
-            }
-        } catch {}
-        if (!referencePathToUse) {
-            console.warn('reference.wav не найден или пуст — генерация без референса. Рекомендуется WAV 10–30 секунд.');
+    constructor(options: VoiceOptions = {}) {
+        this.options = {
+            name: 'алиса',
+            silenceThreshold: 2000,
+            enableTranscription: true,
+            enableTTS: true,
+            useAnnouncerAI: false,
+            ...options
+        };
+
+        this.audioDeviceManager = new AudioDeviceManager();
+
+        this.transcriber = this.options.transcriber || new VoskTranscriber();
+        this.tts = this.options.tts || new ZonosTTSEngine(this.audioDeviceManager);
+
+        if (!this.options.apikey && !process.env.OPENROUTER_API_KEY) {
+            console.warn("API ключ не предоставлен. AI-функции будут недоступны.");
         } else {
-            console.log(`Используется референсное аудио: ${referencePathToUse}`);
+            this.aiProvider = new OpenRouterProvider({
+                token: this.options.apikey || process.env.OPENROUTER_API_KEY || '',
+                model: this.options.model || 'google/gemini-flash-1.5',
+            });
+        }
+    }
+
+    /**
+     * Инициализирует все необходимые ресурсы и сервисы (STT, TTS, AI).
+     * Переводит ассистент в рабочее состояние.
+     */
+    public async initialize(): Promise<void> {
+        if (this.state !== VoiceState.IDLE) {
+            console.warn(`Попытка инициализации в состоянии ${this.state}. Игнорируется.`);
+            return;
         }
 
-        console.log(`Генерируем речь для текста: "${ttsText}"`);
-        const audioBuffer: Buffer = await client.generateSpeech(ttsText, referencePathToUse, 'ru');
-        if (!audioBuffer || audioBuffer.length < 100) {
-            throw new Error(`Сгенерированный аудиобуфер пуст или слишком мал (${audioBuffer ? audioBuffer.length : 0} байт). Проверьте референсное аудио или логи сервера.`);
+        console.log("Инициализация голосового ассистента...");
+        this.state = VoiceState.INITIALIZING;
+
+        try {
+            await this.audioDeviceManager.initialize();
+
+            if (this.options.enableTranscription) {
+                await this.transcriber.initialize();
+            }
+            if (this.options.enableTTS) {
+                await this.tts.initialize();
+            }
+            
+            this.initializeDialog();
+
+            this.state = VoiceState.LISTENING_FOR_KEYWORD;
+            console.log("✅ Ассистент инициализирован и готов к работе.");
+        } catch (error) {
+            console.error("❌ Ошибка при инициализации:", error);
+            this.state = VoiceState.IDLE;
+        }
+    }
+
+    /**
+     * Запускает основной цикл прослушивания микрофона.
+     */
+    public async startListening(): Promise<void> {
+        if (this.state !== VoiceState.LISTENING_FOR_KEYWORD) {
+            console.warn(`Нельзя начать прослушивание в состоянии ${this.state}.`);
+                            return;
+                        }
+        if (!this.options.enableTranscription) {
+            console.log("Распознавание речи отключено. Прослушивание невозможно.");
+                            return;
+                        }
+
+        console.log(`👂 Ожидание ключевого слова "${this.options.name}"...`);
+        this.transcriber.start(this.handleTranscriptionResult.bind(this));
+
+        this.silenceCheckInterval = setInterval(async () => {
+            if (this.state === VoiceState.RECORDING_COMMAND && (Date.now() - this.lastSpeechTime) > (this.options.silenceThreshold || 2000)) {
+                const fullCommand = this.commandBuffer.join(' ').replace(this.options.name || 'алиса', '').trim();
+                this.commandBuffer = [];
+                
+                if (fullCommand) {
+                    await this.ask(fullCommand);
+                } else {
+                    console.log("Команда не распознана, возврат в режим ожидания.");
+                    this.state = VoiceState.LISTENING_FOR_KEYWORD;
+                }
+            }
+        }, 200);
+    }
+
+    /**
+     * Останавливает все процессы и освобождает захваченные ресурсы.
+     */
+    public async destroy(): Promise<void> {
+        if (this.state === VoiceState.IDLE) return;
+        
+        if (this.silenceCheckInterval) {
+            clearInterval(this.silenceCheckInterval);
+            this.silenceCheckInterval = undefined;
+        }
+        
+        console.log("Освобождение ресурсов...");
+        this.state = VoiceState.DESTROYING;
+
+        await this.transcriber.destroy();
+        await this.tts.destroy();
+        this.dialog = undefined;
+        
+        this.state = VoiceState.IDLE;
+        console.log("✅ Ресурсы освобождены.");
+    }
+
+    /**
+     * Отправляет текстовую команду AI на обработку.
+     * @param command - Текстовая команда.
+     */
+    public async ask(command: string): Promise<void> {
+        if (!this.dialog) {
+            console.error("Dialog не инициализирован. Вызовите initialize() сначала.");
+            return;
+        }
+        if (this.state !== VoiceState.LISTENING_FOR_KEYWORD && this.state !== VoiceState.RECORDING_COMMAND) {
+            console.warn(`Вызов ask в состоянии ${this.state}. Может привести к неожиданному поведению.`);
         }
 
-        const __filename = fileURLToPath(import.meta.url);
-        const __dirnameLocal = path.dirname(__filename);
-        const outPath = path.resolve(__dirnameLocal, 'output_zonos.wav');
-        fs.writeFileSync(outPath, audioBuffer);
-        console.log(`Аудио сохранено в ${outPath}`);
+        this.state = VoiceState.AWAITING_AI_RESPONSE;
+        console.log(`🤖 Отправляю команду в Dialog: "${command}"`);
+        this.dialog.ask({ role: 'user', content: command });
+    }
+
+    private initializeDialog(): void {
+        if (!this.aiProvider) {
+            console.error("AI Provider не инициализирован. Невозможно создать Dialog.");
+            return;
+        }
+
+        const tools = [
+            new ExecJSTool(),
+            new TerminalTool({ timeout: 30000 })
+        ];
+
+        const systemPrompt = this.options.system_prompt || this.createSystemPrompt(tools);
+
+        this.dialog = new Dialog({
+            provider: this.aiProvider,
+            tools: tools,
+            systemPrompt: systemPrompt,
+            onChange: this.handleDialogEvent.bind(this),
+        });
+    }
+
+    private createSystemPrompt(tools: Tool[]): string {
+        const appContext = `You are a voice assistant named "${this.options.name || 'Assistant'}".
+        Communication Guidelines: Always use "we" when referring to our work together.
+        ${this.options.useAnnouncerAI 
+            ? "Your full, detailed response will be processed by a secondary AI to create a concise summary for voice playback. Focus on providing the best and most complete answer."
+            : "Your full response will be read aloud. Use <VOICE>TEXT_FOR_VOICE</VOICE> tags to specify exactly what needs to be spoken. The text inside the tags should be concise and clear for voice playback."
+        }`;
+        
+        const toolDescriptions = tools.map(tool => tool.contextPreprompt);
+        return createSystemPrompt(appContext, toolDescriptions);
+    }
+
+    private async handleDialogEvent(event: DialogEvent): Promise<void> {
+        console.log(`[Dialog Event] ${event.type}`); // Basic logging
+        switch (event.type) {
+            case 'ai_response':
+                this.state = VoiceState.SPEAKING;
+                let textToSpeak: string | null = null;
+                if (this.options.useAnnouncerAI) {
+                    // textToSpeak = await this.getSpeakableResponse(event.content);
+                    console.warn("Режим Announcer AI еще не реализован.");
+                    textToSpeak = "Задача выполнена."; // Placeholder
+                } else {
+                    textToSpeak = this.parseVoiceTags(event.content);
+                }
+
+                if (textToSpeak) {
+                    await this.tts.speak(textToSpeak);
+                }
+                this.state = VoiceState.LISTENING_FOR_KEYWORD;
+                break;
+            
+            case 'done':
+                if (this.state !== VoiceState.SPEAKING) {
+                    this.state = VoiceState.LISTENING_FOR_KEYWORD;
+                }
+                console.log("✅ Обработка команды завершена.");
+                break;
+
+            case 'error':
+                console.error(chalk.red(`\n❌ Ошибка в диалоге: ${event.error}`));
+                this.state = VoiceState.SPEAKING;
+                await this.tts.speak("Произошла ошибка. Пожалуйста, попробуйте еще раз.");
+                this.state = VoiceState.LISTENING_FOR_KEYWORD;
+                break;
+        }
+    }
+
+    private parseVoiceTags(text: string): string | null {
+        const match = text.match(/<VOICE>([\s\S]*?)<\/VOICE>/);
+        return match ? match[1].trim() : null;
+    }
+
+    private handleTranscriptionResult(text: string): void {
+        const lowerText = text.toLowerCase();
+        
+        if (!lowerText.trim()) return;
+
+        this.lastSpeechTime = Date.now();
+
+        if (this.state === VoiceState.LISTENING_FOR_KEYWORD && lowerText.includes(this.options.name || 'алиса')) {
+            console.log(`\n🎯 Ключевое слово "${this.options.name}" обнаружено! Слушаю команду...`);
+            this.state = VoiceState.RECORDING_COMMAND;
+            this.commandBuffer = [text];
+        } else if (this.state === VoiceState.RECORDING_COMMAND) {
+            process.stdout.write(`🎤 ... ${text}\n`);
+            this.commandBuffer.push(text);
+        }
     }
 }
 
 export default Voice;
 
+console.log('[DEBUG] Файл lib/voice.ts загружен. Запуск основного блока...');
+
+const voice = new Voice();
+
+// Self-execution block for running with `npx tsx lib/voice.ts`
+(async () => {
+    console.log("[DEBUG] Внутри async блока. Запуск голосового ассистента...");
+    
+    await voice.initialize();
+    console.log("[DEBUG] voice.initialize() завершен.");
+    
+    await voice.startListening();
+    console.log("[DEBUG] voice.startListening() запущен.");
+
+    console.log("Ассистент запущен. Нажмите Ctrl+C для выхода.");
+
+    process.on('SIGINT', async () => {
+        console.log("\nПолучен сигнал SIGINT. Завершение работы...");
+        await voice.destroy();
+        process.exit(0);
+    });
+})().catch(error => {
+    console.error("[DEBUG] КРИТИЧЕСКАЯ ОШИБКА:", error);
+    process.exit(1);
+});
 
 

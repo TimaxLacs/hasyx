@@ -79,7 +79,11 @@ function UserComponent() {
 The framework re-exports `useSession` from NextAuth for consistency:
 
 ```typescript
-// Use this instead of importing from 'next-auth/react'
+// Auth flows overview (OTP vs Password)
+
+- OTP flow: `/api/auth/credentials/start` → `/api/auth/otp/verify` → `signIn('credentials', { userId })`
+- Password flow: `signIn('credentials', { providerType, identifier, password })`
+- Manage password (authorized): `/api/auth/credentials/status`, `/api/auth/credentials/set`
 import { useSession } from 'hasyx';
 
 function MyComponent() {
@@ -280,7 +284,39 @@ function subscribeToUserChanges(userId: string) {
 *   `async update(options: HasyxMethodOptions): Promise<any>`: Executes an update mutation.
 *   `async delete(options: HasyxMethodOptions): Promise<any>`: Executes a delete mutation.
 *   `subscribe(options: HasyxMethodOptions): Observable<any>`: Initiates a subscription, returning an Apollo Observable. If WebSockets are disabled (`NEXT_PUBLIC_WS=0`), falls back to polling.
+*   `async jwt(): Promise<string>`: Retrieves JWT token from the server for client-side authentication. This method is used when JWT_FORCE is enabled to ensure JWT availability. Returns the JWT token string or throws an error if the request fails.
 *   `async sql(sql: string, source?: string, cascade?: boolean): Promise<any>`: Executes raw SQL against the Hasura database. Requires admin-level access with URL and admin secret. Throws an error if Hasura instance is not available.
+*   `testAuthorize(userId: string, options: TestAuthorizeOptions): Promise<{ axios, apollo, hasyx }>`: (Development & Testing Only) A convenience method for authenticating as a specific user. It calls the global `testAuthorize` function but intelligently passes down the schema and Apollo client options from the current `Hasyx` instance. Options you provide to this method will override the instance's defaults.
+
+    ```typescript
+    // Assuming 'adminHasyx' is an existing Hasyx instance with admin rights
+    
+    async function runTestAsUser(adminHasyx: Hasyx) {
+      // Create a test user first
+      const user = await adminHasyx.insert({
+        table: 'users',
+        object: { email: 'test@example.com', name: 'Test' },
+        returning: ['id']
+      });
+
+      // Now, get authenticated clients for that specific user
+      // It will reuse the schema and apollo options (like URL) from adminHasyx
+      const { hasyx: userHasyx, apollo: userApollo } = await adminHasyx.testAuthorize(
+        user.id,
+        { ws: false } // We can override options for this specific call
+      );
+
+      // userHasyx is now authenticated as the new user
+      const profile = await userHasyx.select({
+        table: 'users',
+        pk_columns: { id: user.id },
+        returning: ['name'],
+        role: 'me'
+      });
+      
+      console.log(profile.name); // "Test"
+    }
+    ```
 
 ### `Hasyx` Class Properties
 

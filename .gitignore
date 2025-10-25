@@ -32,6 +32,7 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+docker-compose.y*
 
 # vercel
 .vercel
@@ -58,6 +59,8 @@ migrations/**/*.d.ts
 /client
 android/**/*.png
 ios/**/*.png
+_components
+_lib
 
 # Capacitor
 
@@ -180,3 +183,10 @@ android/app/src/main/res/xml/config.xml
 # Hasyx doc generation
 public/_doc
 app/hasyx/doc/md.json
+
+# Hasyx config
+hasyx.config.json
+
+# Typedoc
+typedoc
+node_modules

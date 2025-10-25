@@ -1,7 +1,11 @@
 import { EventEmitter } from 'events';
 import * as os from 'os';
 import * as path from 'path';
+import * as fs from 'fs';
 import { spawn, ChildProcess } from 'child_process';
+import Debug from './debug';
+
+const debug = Debug('hasyx:terminal');
 
 // Global terminal registry for cleanup
 const terminalRegistry = new Set<Terminal>();
@@ -32,6 +36,7 @@ export interface TerminalOptions {
   flowControlPause?: string;
   flowControlResume?: string;
   autoStart?: boolean; // Auto-start terminal on creation
+  commandTimeout?: number; // Command timeout in milliseconds, 0 = no timeout
   onData?: (data: string) => void;
   onError?: (error: Error) => void;
   onExit?: (code: number, signal?: number) => void;
@@ -122,24 +127,52 @@ export class Terminal extends EventEmitter {
   private getDefaultShell(): string {
     const platform = os.platform();
     
+    debug('Detecting default shell for platform: %s', platform);
+    
     switch (platform) {
       case 'win32':
-        return process.env.COMSPEC || 'cmd.exe';
+        const comspec = process.env.COMSPEC || 'cmd.exe';
+        debug('Windows detected, using COMSPEC: %s', comspec);
+        return comspec;
       case 'darwin':
       case 'linux':
       default:
-        return process.env.SHELL || '/bin/bash';
+        const shellEnv = process.env.SHELL;
+        debug('Unix-like system detected, SHELL env: %s', shellEnv);
+        
+        // Check if we're in Alpine Linux (common in Docker containers)
+        const isAlpine = process.platform === 'linux' && 
+          (process.env.PATH?.includes('/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin') ||
+           !fs.existsSync('/bin/bash'));
+        
+        debug('Alpine Linux detection: %s', isAlpine);
+        debug('Checking /bin/bash existence: %s', fs.existsSync('/bin/bash'));
+        debug('Checking /bin/sh existence: %s', fs.existsSync('/bin/sh'));
+        
+        if (isAlpine || !fs.existsSync('/bin/bash')) {
+          debug('Using /bin/sh instead of /bin/bash');
+          return '/bin/sh';
+        }
+        
+        const defaultShell = shellEnv || '/bin/bash';
+        debug('Using default shell: %s', defaultShell);
+        return defaultShell;
     }
   }
 
   public start(): Promise<void> {
     return new Promise((resolve, reject) => {
       if (this.childProcess) {
+        debug('Terminal already started, resolving');
         resolve();
         return;
       }
 
       try {
+        debug('Starting terminal with shell: %s, args: %o', this.options.shell, this.options.args);
+        debug('Working directory: %s', this.options.cwd);
+        debug('Environment variables: %o', Object.keys(this.options.env || {}));
+        
         // Set up environment with terminal information
         const env = { ...this.options.env } as any;
         // Add terminal-specific vars
@@ -147,18 +180,24 @@ export class Terminal extends EventEmitter {
         if (this.options.cols) env.COLUMNS = this.options.cols.toString();
         if (this.options.rows) env.LINES = this.options.rows.toString();
 
+        debug('Final environment setup complete');
+
         // Spawn the shell process
+        debug('Spawning shell process...');
         this.childProcess = spawn(this.options.shell!, this.options.args!, {
           cwd: this.options.cwd,
           env: env,
           stdio: ['pipe', 'pipe', 'pipe']
         });
         
+        debug('Shell process spawned with PID: %s', this.childProcess?.pid);
+        
         this.session.isActive = true;
         this.setupChildProcessHandlers();
         
         // Wait a bit for shell to initialize
         setTimeout(() => {
+          debug('Terminal initialization complete, marking as ready');
           this.isReady = true;
           this.processCommandQueue();
           this.emit('ready');
@@ -174,7 +213,10 @@ export class Terminal extends EventEmitter {
           rows: this.options.rows
         });
         
+        debug('Terminal start event emitted');
+        
       } catch (error) {
+        debug('Error starting terminal: %o', error);
         this.emit('error', error);
         if (this.onError) this.onError(error as Error);
         reject(error);
@@ -183,25 +225,31 @@ export class Terminal extends EventEmitter {
   }
 
   public async execute(command: string): Promise<string> {
+    debug('Executing command: %s', command);
     return new Promise<string>((resolve, reject) => {
       if (!this.isReady) {
+        debug('Terminal not ready, queueing command: %s', command);
         // Queue command if terminal is not ready
         this.commandQueue.push({ command, resolve, reject });
         return;
       }
 
       if (!this.childProcess || !this.childProcess.stdin) {
+        debug('Terminal not running, rejecting command: %s', command);
         reject(new Error('Terminal is not running'));
         return;
       }
 
       // For simple command execution, we'll use a separate child process
       // This ensures we get clean output without shell interactions
+      debug('Creating command process with shell: %s, command: %s', this.options.shell, command);
       const commandProcess = spawn(this.options.shell!, ['-c', command], {
         cwd: this.options.cwd,
         env: this.options.env,
         stdio: ['pipe', 'pipe', 'pipe']
       });
+
+      debug('Command process created with PID: %s', commandProcess?.pid);
 
       const terminalCommand: TerminalCommand = {
         id: `cmd_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
@@ -216,14 +264,23 @@ export class Terminal extends EventEmitter {
       let stdout = '';
       let stderr = '';
 
-      // Set up timeout
-      const commandTimeout = setTimeout(() => {
-        commandProcess.kill('SIGKILL');
-        terminalCommand.completed = true;
-        terminalCommand.output = stdout || stderr;
-        this.emit('commandTimeout', terminalCommand);
-        reject(new Error(`Command timeout: ${command}`));
-      }, 10000); // 10 seconds timeout
+      // Set up timeout (0 = no timeout)
+      let commandTimeout: NodeJS.Timeout | null = null;
+      const timeoutMs = this.options.commandTimeout !== undefined ? this.options.commandTimeout : 10000;
+      
+      if (timeoutMs > 0) {
+        debug('Setting timeout for command "%s": %dms', command, timeoutMs);
+        commandTimeout = setTimeout(() => {
+          debug('Command timed out: %s', command);
+          commandProcess.kill('SIGKILL');
+          terminalCommand.completed = true;
+          terminalCommand.output = stdout || stderr;
+          this.emit('commandTimeout', terminalCommand);
+          reject(new Error(`Command timeout: ${command}`));
+        }, timeoutMs);
+      } else {
+        debug('No timeout set for command: %s', command);
+      }
 
       commandProcess.stdout?.on('data', (data) => {
         const output = data.toString(this.options.encoding as BufferEncoding || 'utf8');
@@ -244,22 +301,31 @@ export class Terminal extends EventEmitter {
       });
 
       commandProcess.on('close', (code, signal) => {
-        clearTimeout(commandTimeout);
+        if (commandTimeout) clearTimeout(commandTimeout);
         terminalCommand.completed = true;
         terminalCommand.output = stdout;
+        
+        debug('Command completed: %s, code: %d, stdout length: %d, stderr length: %d', 
+              command, code, stdout.length, stderr.length);
         
         this.emit('commandComplete', terminalCommand);
         
         if (code === 0) {
+          debug('Command successful: %s', command);
           resolve(stdout.trim());
         } else {
+          debug('Command failed: %s, code: %d, error: %s', command, code, stderr || stdout);
           reject(new Error(`Command failed with code ${code}: ${stderr || stdout}`));
         }
       });
 
       commandProcess.on('error', (error) => {
-        clearTimeout(commandTimeout);
+        if (commandTimeout) clearTimeout(commandTimeout);
         terminalCommand.completed = true;
+        debug('Command error: %s, error: %s', command, error.message);
+        debug('Error details - code: %s, syscall: %s, path: %s, errno: %s', 
+              (error as any).code, (error as any).syscall, (error as any).path, (error as any).errno);
+        debug('Shell used: %s, args: %o', this.options.shell, ['-c', command]);
         this.emit('error', error);
         reject(error);
       });
@@ -698,52 +764,14 @@ export function createTerminalDo(callbacks: TerminalDoCallbacks = {}): TerminalD
  * Default terminal context for AI
  */
 export const terminalContext = `
-🖥️  **Terminal Execution Environment**
-
-You can execute terminal commands using various shells with node-pty support.
-
-**Available Shells:**
-- bash - Default Linux/macOS shell
-- zsh - Enhanced shell with better features
-- node - Node.js REPL environment
-- python - Python interactive interpreter
-- docker - Docker container commands
-- ssh - Remote shell access
-
-**Execution Format:**
+You not only text ai model, but also you can execute terminal commands using various shells with node-pty support.
+If you need it, write code not just inside markdown code block, but STRICTLY with this pattern:
 > 😈<uuid>/do/terminal/bash
 \`\`\`bash
 your terminal command here
 \`\`\`
-
-**Examples:**
-> 😈ls1/do/terminal/bash
-\`\`\`bash
-ls -la
-\`\`\`
-
-> 😈info1/do/terminal/bash
-\`\`\`bash
-uname -a && pwd
-\`\`\`
-
-> 😈node1/do/terminal/bash
-\`\`\`bash
-node --version
-\`\`\`
-
-> 😈python1/do/terminal/bash
-\`\`\`bash
-python3 --version
-\`\`\`
-
-**Features:**
-- Real terminal process spawning
-- Command timeout protection (5 seconds)
-- Session management
-- Event handling
-- Cross-platform support
-- Graceful error handling
+You receive the result of the execution after it's done.
+You can make many executions in response with different UUIDs.
 `;
 
 /**

@@ -12,7 +12,11 @@ const WaveFileLib = WaveFileOriginal;
 import { exec } from 'child_process';
 import { promisify } from 'util';
 const execAsync = promisify(exec);
+import { PassThrough } from 'stream';
 
+/**
+ * Интерфейс, описывающий аудиоустройство.
+ */
 interface AudioDevice {
     id: number;
     name: string;
@@ -43,6 +47,9 @@ interface WaveFile {
     toBuffer(): Buffer;
 }
 
+/**
+ * Управляет аудиоустройствами, записью и воспроизведением.
+ */
 class AudioDeviceManager {
     private rtAudio: any;
     private currentInputDevice: AudioDevice | null;
@@ -448,6 +455,43 @@ class AudioDeviceManager {
      */
     requiresRtAudio(): boolean {
         return this.isWindows || this.isMacOS;
+    }
+
+    /**
+     * Воспроизводит аудио из буфера.
+     * @param buffer - WAV-буфер для воспроизведения.
+     */
+    public async playAudio(buffer: Buffer): Promise<void> {
+        return new Promise((resolve, reject) => {
+            let playCommand: string;
+            if (this.isLinux) {
+                // aplay ожидает WAV формат, поэтому передаем данные как есть
+                playCommand = 'aplay -f cd -t wav';
+            } else if (this.isMacOS) {
+                // afplay также может читать из stdin
+                playCommand = 'afplay';
+            } else {
+                // Для Windows потребуется более сложный подход, возможно, с временным файлом
+                // или другой утилитой. Пока оставим заглушку.
+                return reject(new Error("Воспроизведение из буфера на Windows пока не поддерживается."));
+            }
+
+            const player = exec(playCommand, (error, stdout, stderr) => {
+                if (error) {
+                    console.error(`Ошибка воспроизведения: ${stderr}`);
+                    return reject(error);
+                }
+                resolve();
+            });
+
+            if (player.stdin) {
+                const stream = new PassThrough();
+                stream.end(buffer);
+                stream.pipe(player.stdin);
+            } else {
+                reject(new Error("Не удалось получить доступ к stdin процесса воспроизведения."));
+            }
+        });
     }
 }
 

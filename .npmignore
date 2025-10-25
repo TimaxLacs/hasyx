@@ -51,6 +51,9 @@ lib/**/*.ts
 lib/**/*.tsx
 !lib/*.d.ts
 !lib/**/*.d.ts
+# publish staged scaffolds
+!_lib/**
+!_components/**
 components/*.ts
 components/*.tsx
 components/**/*.ts
@@ -186,3 +189,9 @@ android/app/src/main/res/xml/config.xml
 
 # Hasyx doc generation
 public/doc
+
+# Hasyx config
+hasyx.config.json
+
+# Typedoc
+typedoc

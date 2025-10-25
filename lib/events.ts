@@ -1,18 +1,14 @@
-import { Hasura } from './hasura';
+import { Hasura } from './hasura/hasura';
 import Debug from './debug';
 import fs from 'fs-extra';
 import path from 'path';
 import { NextRequest, NextResponse } from 'next/server';
 import dotenv from 'dotenv';
-import { API_URL } from './url';
 
+// dotenv.config({ path: path.join(process.cwd(), '.env') });
 dotenv.config();
 
 const debug = Debug('events');
-
-if (!API_URL) {
-  throw new Error('NEXT_PUBLIC_MAIN_URL | NEXT_PUBLIC_BASE_URL || NEXT_PUBLIC_API_URL is not set');
-}
 
 /**
  * Structure of a Hasura Event Trigger definition file
@@ -46,6 +42,49 @@ export interface EventTriggerDefinition {
     value?: string;
     value_from_env?: string;
   }[];
+}
+
+/**
+ * Structure of a Hasura Cron Trigger definition file
+ */
+export interface CronTriggerDefinition {
+  name: string;
+  webhook?: string; // Full URL for webhook
+  webhook_path?: string; // Path only, to be combined with API_URL
+  schedule: string; // Cron expression
+  payload?: any; // JSON payload to send
+  comment?: string; // Optional comment
+  retry_conf?: {
+    num_retries?: number;
+    timeout_seconds?: number;
+    tolerance_seconds?: number;
+    retry_interval_seconds?: number;
+  };
+  headers?: {
+    name: string;
+    value?: string;
+    value_from_env?: string;
+  }[];
+  include_in_metadata?: boolean; // Whether to include in metadata export
+}
+
+/**
+ * Union type for both event and cron trigger definitions
+ */
+export type TriggerDefinition = EventTriggerDefinition | CronTriggerDefinition;
+
+/**
+ * Type guard to check if definition is a cron trigger
+ */
+export function isCronTrigger(def: TriggerDefinition): def is CronTriggerDefinition {
+  return 'schedule' in def;
+}
+
+/**
+ * Type guard to check if definition is an event trigger
+ */
+export function isEventTrigger(def: TriggerDefinition): def is EventTriggerDefinition {
+  return 'table' in def;
 }
 
 /**
@@ -83,17 +122,54 @@ export function validateEventTriggerDefinition(def: EventTriggerDefinition): str
 }
 
 /**
- * Load all event trigger definitions from a directory
+ * Validate that a cron trigger definition has all required fields
  */
-export async function loadEventTriggerDefinitions(eventsDir: string): Promise<EventTriggerDefinition[]> {
-  debug(`Loading event trigger definitions from ${eventsDir}`);
-  const triggers: EventTriggerDefinition[] = [];
+export function validateCronTriggerDefinition(def: CronTriggerDefinition): string[] {
+  const errors: string[] = [];
+
+  if (!def.name) {
+    errors.push('Cron trigger must have a name');
+  }
+
+  if (!def.schedule) {
+    errors.push('Cron trigger must specify a schedule (cron expression)');
+  }
+
+  // Either webhook or webhook_path must be specified
+  if (!def.webhook && !def.webhook_path) {
+    errors.push('Cron trigger must specify either webhook or webhook_path');
+  }
+
+  return errors;
+}
+
+/**
+ * Validate a trigger definition (either event or cron)
+ */
+export function validateTriggerDefinition(def: TriggerDefinition): string[] {
+  if (isCronTrigger(def)) {
+    return validateCronTriggerDefinition(def);
+  } else {
+    return validateEventTriggerDefinition(def);
+  }
+}
+
+/**
+ * Load all trigger definitions from a directory (both event and cron triggers)
+ */
+export async function loadTriggerDefinitions(eventsDir: string): Promise<{
+  eventTriggers: EventTriggerDefinition[];
+  cronTriggers: CronTriggerDefinition[];
+}> {
+  debug(`Loading trigger definitions from ${eventsDir}`);
+  const eventTriggers: EventTriggerDefinition[] = [];
+  const cronTriggers: CronTriggerDefinition[] = [];
 
   try {
     // Ensure the directory exists
     if (!await fs.pathExists(eventsDir)) {
       debug(`Events directory ${eventsDir} does not exist`);
-      return [];
+      return { eventTriggers, cronTriggers };
     }
 
     // Read all files in the directory
@@ -110,7 +186,7 @@ export async function loadEventTriggerDefinitions(eventsDir: string): Promise<Ev
       try {
         const filePath = path.join(eventsDir, file);
         const content = await fs.readFile(filePath, 'utf8');
-        const triggerDef: EventTriggerDefinition = JSON.parse(content);
+        const triggerDef: TriggerDefinition = JSON.parse(content);
 
         // Use filename (without extension) as trigger name if not specified
         if (!triggerDef.name) {
@@ -118,23 +194,36 @@ export async function loadEventTriggerDefinitions(eventsDir: string): Promise<Ev
           debug(`Using filename as trigger name: ${triggerDef.name}`);
         }
 
-        // Validate the trigger definition
-        const errors = validateEventTriggerDefinition(triggerDef);
+        // Validate and categorize the trigger definition
+        const errors = validateTriggerDefinition(triggerDef);
         if (errors.length > 0) {
-          debug(`Invalid event trigger definition in ${file}: ${errors.join(', ')}`);
+          debug(`Invalid trigger definition in ${file}: ${errors.join(', ')}`);
         } else {
-          triggers.push(triggerDef);
-          debug(`Loaded event trigger definition: ${triggerDef.name}`);
+          if (isCronTrigger(triggerDef)) {
+            cronTriggers.push(triggerDef);
+            debug(`Loaded cron trigger definition: ${triggerDef.name}`);
+          } else {
+            eventTriggers.push(triggerDef);
+            debug(`Loaded event trigger definition: ${triggerDef.name}`);
+          }
         }
       } catch (error) {
         debug(`Error processing file ${file}: ${error}`);
       }
     }
   } catch (error) {
-    debug(`Error loading event trigger definitions: ${error}`);
+    debug(`Error loading trigger definitions: ${error}`);
   }
 
-  return triggers;
+  return { eventTriggers, cronTriggers };
+}
+
+/**
+ * Load all event trigger definitions from a directory (legacy function)
+ */
+export async function loadEventTriggerDefinitions(eventsDir: string): Promise<EventTriggerDefinition[]> {
+  const { eventTriggers } = await loadTriggerDefinitions(eventsDir);
+  return eventTriggers;
 }
 
 /**
@@ -146,6 +235,12 @@ export async function createOrUpdateEventTrigger(
   baseUrl?: string
 ): Promise<boolean> {
   try {
+    const API_URL = process.env.NEXT_PUBLIC_API_URL || process.env.NEXT_PUBLIC_MAIN_URL || process.env.NEXT_PUBLIC_BASE_URL;
+
+    if (!API_URL) {
+      throw new Error('NEXT_PUBLIC_MAIN_URL | NEXT_PUBLIC_BASE_URL || NEXT_PUBLIC_API_URL is not set');
+    }
+
     debug(`Creating/updating event trigger: ${trigger.name}`);
 
     // Prepare the URL - use webhook if provided, otherwise combine baseUrl with webhook_path
@@ -174,37 +269,65 @@ export async function createOrUpdateEventTrigger(
     // Set default source if not specified
     const source = trigger.source || 'default';
 
-    // Check if trigger already exists using pg_get_event_triggers metadata API
-    const existingTriggersResponse = await hasura.v1({
-      type: 'export_metadata',
-      args: {}
-    });
-
-    // Parse the metadata to check if the trigger exists
-    let triggerExists = false;
-    if (existingTriggersResponse?.metadata?.sources) {
-      for (const sourceObj of existingTriggersResponse.metadata.sources) {
-        if (sourceObj.name !== source) continue;
-
-        if (sourceObj.tables) {
-          for (const table of sourceObj.tables) {
-            if (table.table.schema === trigger.table.schema &&
-              table.table.name === trigger.table.name &&
-              table.event_triggers) {
-              triggerExists = table.event_triggers.some((et: { name: string }) => et.name === trigger.name);
-              if (triggerExists) {
-                debug(`Event trigger ${trigger.name} already exists, updating...`);
-                break;
+    // Always try to delete the trigger first to ensure clean state
+    debug(`Attempting to delete event trigger ${trigger.name} before creating (if it exists)`);
+    try {
+      await hasura.v1({
+        type: 'delete_event_trigger',
+        args: {
+          name: trigger.name,
+          source
+        }
+      });
+      debug(`Event trigger ${trigger.name} deleted successfully`);
+      
+      // Clean up orphaned SQL functions and triggers
+      await cleanupHasuraEventTriggerSQL(hasura, trigger.name, trigger.table.name, trigger.table.schema);
+      
+      // Verify deletion by checking metadata
+      try {
+        const verifyResponse = await hasura.v1({
+          type: 'export_metadata',
+          args: {}
+        });
+        
+        let stillExists = false;
+        if (verifyResponse?.sources) {
+          for (const sourceObj of verifyResponse.sources) {
+            if (sourceObj.name !== source) continue;
+            if (sourceObj.tables) {
+              for (const table of sourceObj.tables) {
+                if (table.event_triggers) {
+                  stillExists = table.event_triggers.some((et: { name: string }) => et.name === trigger.name);
+                  if (stillExists) {
+                    debug(`⚠️ Trigger ${trigger.name} still exists in table ${table.table.schema}.${table.table.name} after deletion!`);
+                    break;
+                  }
+                }
               }
             }
+            if (stillExists) break;
           }
         }
-
-        if (triggerExists) break;
+        
+        if (!stillExists) {
+          debug(`✅ Verified: Trigger ${trigger.name} successfully removed from metadata`);
+        }
+      } catch (verifyErr) {
+        debug(`Failed to verify deletion: ${verifyErr}`);
+      }
+      
+      // Small delay to ensure metadata consistency
+      await new Promise(resolve => setTimeout(resolve, 100));
+    } catch (delErr: any) {
+      if (delErr?.response?.data?.error?.includes('does not exist')) {
+        debug(`Event trigger ${trigger.name} did not exist, proceeding with creation`);
+      } else {
+        debug(`Failed to delete event trigger ${trigger.name}:`, delErr?.response?.data || delErr);
       }
     }
 
-    // Prepare the arguments for the API call
+    // Prepare the arguments for the API call using the Postgres backend spec (pg_create_event_trigger)
     const args: any = {
       name: trigger.name,
       source,
@@ -212,7 +335,6 @@ export async function createOrUpdateEventTrigger(
       webhook: webhookUrl
     };
 
-    // Add operation configurations
     if (trigger.insert) args.insert = trigger.insert;
     if (trigger.update) args.update = trigger.update;
     if (trigger.delete) args.delete = trigger.delete;
@@ -247,17 +369,20 @@ export async function createOrUpdateEventTrigger(
     // Add headers to args if any exist
     if (headers.length > 0) args.headers = headers;
 
-    // Set replace to true if the trigger already exists
-    args.replace = triggerExists;
+    // Set replace to false since we delete before creating
+    args.replace = false;
 
-    // Create or update the event trigger
-    const type = 'pg_create_event_trigger'; // Currently only supporting Postgres
-    const result = await hasura.v1({
-      type,
-      args
-    });
+    // Create or update the event trigger (Postgres backend)
+    const type = 'pg_create_event_trigger';
+    const result = await hasura.v1({ type, args });
 
-    debug(`Event trigger ${trigger.name} ${triggerExists ? 'updated' : 'created'} successfully`);
+    if (result && (result.error || result.code)) {
+      debug(`❌ Error response for ${trigger.name}:`, JSON.stringify(result));
+      return false;
+    }
+
+    debug(`✅ API response for ${trigger.name}:`, JSON.stringify(result));
+    debug(`Event trigger ${trigger.name} created successfully`);
     return true;
   } catch (error) {
     debug(`Error creating/updating event trigger ${trigger.name}: ${error}`);
@@ -285,6 +410,95 @@ export async function deleteEventTrigger(hasura: Hasura, name: string, source: s
   } catch (error) {
     debug(`Error deleting event trigger ${name}: ${error}`);
     return false;
+  }
+}
+
+/**
+ * Clean up orphaned Hasura SQL functions and triggers for a specific event trigger
+ * This is needed because Hasura's delete_event_trigger doesn't always clean up SQL objects
+ */
+export async function cleanupHasuraEventTriggerSQL(
+  hasura: Hasura,
+  triggerName: string,
+  tableName?: string,
+  schemaName: string = 'public'
+): Promise<void> {
+  try {
+    debug(`🧹 Cleaning up SQL objects for event trigger: ${triggerName}`);
+    
+    // Clean up SQL functions in hdb_catalog schema
+    const functionPatterns = [
+      `notify_hasura_${triggerName}_INSERT`,
+      `notify_hasura_${triggerName}_UPDATE`, 
+      `notify_hasura_${triggerName}_DELETE`
+    ];
+    
+    for (const functionName of functionPatterns) {
+      try {
+        await hasura.sql(`DROP FUNCTION IF EXISTS hdb_catalog."${functionName}"() CASCADE;`);
+        debug(`✅ Dropped function: hdb_catalog.${functionName}`);
+      } catch (err) {
+        debug(`⚠️ Failed to drop function hdb_catalog.${functionName}:`, err);
+      }
+    }
+    
+    // If table name is provided, clean up any remaining triggers on that table
+    if (tableName) {
+      const triggerPatterns = [
+        `${triggerName}_INSERT`,
+        `${triggerName}_UPDATE`,
+        `${triggerName}_DELETE`
+      ];
+      
+      for (const triggerPattern of triggerPatterns) {
+        try {
+          await hasura.sql(`DROP TRIGGER IF EXISTS "${triggerPattern}" ON "${schemaName}"."${tableName}" CASCADE;`);
+          debug(`✅ Dropped trigger: ${schemaName}.${tableName}.${triggerPattern}`);
+        } catch (err) {
+          debug(`⚠️ Failed to drop trigger ${triggerPattern}:`, err);
+        }
+      }
+    }
+    
+    debug(`✅ SQL cleanup completed for event trigger: ${triggerName}`);
+  } catch (error) {
+    debug(`❌ Error during SQL cleanup for ${triggerName}:`, error);
+  }
+}
+
+/**
+ * Clean up all orphaned Hasura event trigger SQL functions
+ * This removes all notify_hasura_* functions that may be left behind
+ */
+export async function cleanupAllOrphanedHasuraSQL(hasura: Hasura): Promise<void> {
+  try {
+    debug(`🧹 Cleaning up all orphaned Hasura SQL functions...`);
+    
+    // Get all notify_hasura_* functions
+    const result = await hasura.sql(`
+      SELECT p.proname as function_name 
+      FROM pg_proc p 
+      JOIN pg_namespace n ON p.pronamespace = n.oid 
+      WHERE n.nspname = 'hdb_catalog' 
+      AND p.proname LIKE 'notify_hasura_%';
+    `);
+    
+    if (result?.result && Array.isArray(result.result) && result.result.length > 1) {
+      // Skip header row
+      for (let i = 1; i < result.result.length; i++) {
+        const functionName = result.result[i][0];
+        try {
+          await hasura.sql(`DROP FUNCTION IF EXISTS hdb_catalog."${functionName}"() CASCADE;`);
+          debug(`✅ Dropped orphaned function: hdb_catalog.${functionName}`);
+        } catch (err) {
+          debug(`⚠️ Failed to drop orphaned function ${functionName}:`, err);
+        }
+      }
+    }
+    
+    debug(`✅ All orphaned Hasura SQL functions cleaned up`);
+  } catch (error) {
+    debug(`❌ Error during orphaned SQL cleanup:`, error);
   }
 }
 
@@ -343,6 +557,40 @@ export async function syncEventTriggers(hasura: Hasura, localTriggers: EventTrig
   try {
     debug('Starting event trigger synchronization');
 
+    // First, clear any inconsistent metadata that might block operations
+    debug('Clearing inconsistent metadata before synchronization');
+    try {
+      await hasura.dropInconsistentMetadata();
+      debug('✅ Inconsistent metadata cleared successfully');
+    } catch (clearError) {
+      debug('⚠️ Could not clear inconsistent metadata (may not exist):', clearError);
+    }
+
+    // Clean up any orphaned SQL functions that might interfere
+    debug('Cleaning up orphaned SQL functions');
+    try {
+      await cleanupAllOrphanedHasuraSQL(hasura);
+      debug('✅ Orphaned SQL functions cleaned up');
+    } catch (cleanupError) {
+      debug('⚠️ Could not clean up orphaned SQL functions:', cleanupError);
+    }
+    
+    // Then, reload metadata with recreate_event_triggers to fix any ghost triggers
+    debug('Reloading metadata with event trigger recreation to fix ghost triggers');
+    try {
+      await hasura.v1({
+        type: 'reload_metadata',
+        args: {
+          reload_remote_schemas: false,
+          reload_sources: false,
+          recreate_event_triggers: true
+        }
+      });
+      debug('Metadata reloaded successfully with event trigger recreation');
+    } catch (reloadError) {
+      debug('Failed to reload metadata:', reloadError);
+    }
+
     // Get existing triggers from Hasura
     const existingTriggers = await getExistingEventTriggers(hasura);
 
@@ -373,21 +621,185 @@ export async function syncEventTriggers(hasura: Hasura, localTriggers: EventTrig
 }
 
 /**
- * Main function to synchronize all event triggers from a directory
+ * Create or update a cron trigger in Hasura
  */
-export async function syncEventTriggersFromDirectory(eventsDir: string, hasuraUrl?: string, hasuraSecret?: string, baseUrl?: string): Promise<void> {
-  debug('Synchronizing event triggers from directory');
+export async function createOrUpdateCronTrigger(
+  hasura: Hasura,
+  trigger: CronTriggerDefinition,
+  baseUrl?: string
+): Promise<boolean> {
+  debug(`Creating/updating cron trigger: ${trigger.name}`);
+  
+  const API_URL = process.env.NEXT_PUBLIC_API_URL || process.env.NEXT_PUBLIC_MAIN_URL || process.env.NEXT_PUBLIC_BASE_URL;
+
+  if (!API_URL) {
+    throw new Error('NEXT_PUBLIC_MAIN_URL | NEXT_PUBLIC_BASE_URL || NEXT_PUBLIC_API_URL is not set');
+  }
+
+  try {
+    // Validate the trigger definition
+    const errors = validateCronTriggerDefinition(trigger);
+    if (errors.length > 0) {
+      debug(`Cron trigger ${trigger.name} validation errors: ${errors.join(', ')}`);
+      return false;
+    }
+
+    // Construct the webhook URL
+    let webhookUrl = trigger.webhook;
+    if (!webhookUrl && trigger.webhook_path) {
+      const base = baseUrl || API_URL;
+      webhookUrl = `${base}${trigger.webhook_path}`;
+    }
+
+    if (!webhookUrl) {
+      debug(`Cron trigger ${trigger.name} is missing webhook URL`);
+      return false;
+    }
+
+    // Prepare headers with environment variable resolution
+    const headers = (trigger.headers || []).map(header => {
+      if (header.value_from_env) {
+        return {
+          name: header.name,
+          value: process.env[header.value_from_env] || ''
+        };
+      }
+      return {
+        name: header.name,
+        value: header.value || ''
+      };
+    });
+
+    // Create or update the cron trigger
+    await hasura.defineCronTrigger({
+      name: trigger.name,
+      webhook: webhookUrl,
+      schedule: trigger.schedule,
+      payload: trigger.payload,
+      headers,
+      replace: true
+    });
+
+    debug(`Cron trigger ${trigger.name} created/updated successfully`);
+    return true;
+  } catch (error) {
+    debug(`Error creating/updating cron trigger ${trigger.name}: ${error}`);
+    return false;
+  }
+}
+
+/**
+ * Delete a cron trigger from Hasura
+ */
+export async function deleteCronTrigger(hasura: Hasura, name: string): Promise<boolean> {
+  debug(`Deleting cron trigger: ${name}`);
+
+  try {
+    await hasura.deleteCronTrigger({ name });
+    debug(`Cron trigger ${name} deleted successfully`);
+    return true;
+  } catch (error) {
+    debug(`Error deleting cron trigger ${name}: ${error}`);
+    return false;
+  }
+}
+
+/**
+ * Get existing cron triggers from Hasura
+ */
+export async function getExistingCronTriggers(hasura: Hasura): Promise<Record<string, CronTriggerDefinition>> {
+  debug('Getting existing cron triggers from Hasura');
+
+  try {
+    const metadata = await hasura.exportMetadata();
+    const cronTriggers = metadata.cron_triggers || [];
+
+    const existingTriggers: Record<string, CronTriggerDefinition> = {};
+
+    for (const trigger of cronTriggers) {
+      // Convert Hasura format back to our definition format
+      const definition: CronTriggerDefinition = {
+        name: trigger.name,
+        webhook: trigger.webhook,
+        schedule: trigger.schedule,
+        payload: trigger.payload,
+        comment: trigger.comment,
+        retry_conf: trigger.retry_conf ? {
+          num_retries: trigger.retry_conf.num_retries,
+          timeout_seconds: trigger.retry_conf.timeout_seconds,
+          tolerance_seconds: trigger.retry_conf.tolerance_seconds,
+          retry_interval_seconds: trigger.retry_conf.retry_interval_seconds
+        } : undefined,
+        headers: trigger.headers ? trigger.headers.map((h: any) => ({
+          name: h.name,
+          value: h.value
+        })) : undefined,
+        include_in_metadata: trigger.include_in_metadata
+      };
+
+      existingTriggers[trigger.name] = definition;
+    }
+
+    debug(`Found ${Object.keys(existingTriggers).length} existing cron triggers`);
+    return existingTriggers;
+  } catch (error) {
+    debug(`Error getting existing cron triggers: ${error}`);
+    return {};
+  }
+}
+
+/**
+ * Synchronize local cron trigger definitions with Hasura
+ */
+export async function syncCronTriggers(hasura: Hasura, localTriggers: CronTriggerDefinition[], baseUrl?: string): Promise<void> {
+  debug(`Synchronizing ${localTriggers.length} cron triggers with Hasura`);
+
+  try {
+    // Get existing triggers from Hasura
+    const existingTriggers = await getExistingCronTriggers(hasura);
+    const existingNames = new Set(Object.keys(existingTriggers));
+    const localNames = new Set(localTriggers.map(t => t.name));
+
+    // Create or update local triggers
+    for (const trigger of localTriggers) {
+      const success = await createOrUpdateCronTrigger(hasura, trigger, baseUrl);
+      if (success) {
+        debug(`✓ Cron trigger ${trigger.name} synchronized`);
+      } else {
+        debug(`✗ Failed to synchronize cron trigger ${trigger.name}`);
+      }
+    }
+
+    // Delete triggers that exist in Hasura but not locally
+    for (const existingName of existingNames) {
+      if (!localNames.has(existingName)) {
+        debug(`Deleting cron trigger ${existingName} (not found locally)`);
+        await deleteCronTrigger(hasura, existingName);
+      }
+    }
+
+    debug('Cron trigger synchronization completed');
+  } catch (error) {
+    debug(`Error synchronizing cron triggers: ${error}`);
+  }
+}
+
+/**
+ * Synchronize all triggers (both event and cron) from a directory
+ */
+export async function syncAllTriggersFromDirectory(eventsDir: string, hasuraUrl?: string, hasuraSecret?: string, baseUrl?: string): Promise<void> {
+  debug('Synchronizing all triggers from directory');
 
   // Check if HASURA_EVENT_SECRET is set
   const eventSecret = process.env.HASURA_EVENT_SECRET;
   if (!eventSecret) {
     debug('HASURA_EVENT_SECRET not set in environment');
-    console.warn('⚠️ WARNING: HASURA_EVENT_SECRET is not set. This is required for secure event trigger handling.');
+    console.warn('⚠️ WARNING: HASURA_EVENT_SECRET is not set. This is required for secure trigger handling.');
     console.warn('   Please set HASURA_EVENT_SECRET in your environment variables.');
 
     // In production, we should fail if the secret is not set
     if (process.env.NODE_ENV === 'production') {
-      throw new Error('HASURA_EVENT_SECRET is required for event trigger synchronization in production');
+      throw new Error('HASURA_EVENT_SECRET is required for trigger synchronization in production');
     }
   }
 
@@ -397,17 +809,36 @@ export async function syncEventTriggersFromDirectory(eventsDir: string, hasuraUr
 
   if (!url || !secret) {
     debug('Missing Hasura URL or admin secret');
-    throw new Error('NEXT_PUBLIC_HASURA_GRAPHQL_URL and HASURA_ADMIN_SECRET are required for event trigger synchronization');
+    throw new Error('NEXT_PUBLIC_HASURA_GRAPHQL_URL and HASURA_ADMIN_SECRET are required for trigger synchronization');
   }
 
   const hasura = new Hasura({ url, secret });
 
-  // Load trigger definitions from the directory
-  const triggers = await loadEventTriggerDefinitions(eventsDir);
-  debug(`Loaded ${triggers.length} event trigger definitions`);
+  // Clean up any orphaned Hasura SQL functions before syncing
+  debug('🧹 Cleaning up orphaned Hasura SQL functions before synchronization...');
+  await cleanupAllOrphanedHasuraSQL(hasura);
 
-  // Synchronize the triggers with Hasura
-  await syncEventTriggers(hasura, triggers, baseUrl);
+  // Load all trigger definitions from the directory
+  const { eventTriggers, cronTriggers } = await loadTriggerDefinitions(eventsDir);
+  debug(`Loaded ${eventTriggers.length} event triggers and ${cronTriggers.length} cron triggers`);
+
+  // Synchronize both types of triggers
+  await Promise.all([
+    syncEventTriggers(hasura, eventTriggers, baseUrl),
+    syncCronTriggers(hasura, cronTriggers, baseUrl)
+  ]);
+
+  debug('All triggers synchronized successfully');
+}
+
+/**
+ * Main function to synchronize all event triggers from a directory (backward compatibility)
+ */
+export async function syncEventTriggersFromDirectory(eventsDir: string, hasuraUrl?: string, hasuraSecret?: string, baseUrl?: string): Promise<void> {
+  debug('Synchronizing event triggers from directory (legacy function - use syncAllTriggersFromDirectory for full support)');
+  
+  // For backward compatibility, call the new function
+  await syncAllTriggersFromDirectory(eventsDir, hasuraUrl, hasuraSecret, baseUrl);
 }
 
 /**
@@ -557,7 +988,8 @@ export function hasyxEvent(
   handler: (payload: HasuraEventPayload) => Promise<Response | NextResponse | any>
 ) {
   return async (request: NextRequest, context?: any) => {
-    const triggerName = context?.params?.name || 'unknown';
+    const params = await context.params;
+    const triggerName = params?.name || 'unknown';
     debug(`Received event trigger for ${triggerName}`);
 
     // Verify that the request is from Hasura
@@ -573,6 +1005,15 @@ export function hasyxEvent(
       // Parse the request body
       const body = await request.json();
       debug(`Raw request body for ${triggerName}:`, body);
+
+      // Scheduled event (one-off/cron) compatibility: accept and ACK even if payload shape differs
+      // Hasura scheduled events send keys like: scheduled_time, payload, name (for cron), id
+      if (body && typeof body === 'object' && !('event' in body) && (
+        'scheduled_time' in body || ('payload' in body && 'id' in body)
+      )) {
+        debug(`Detected scheduled event payload for ${triggerName}. Sending ACK 200.`);
+        return NextResponse.json({ success: true, scheduled: true, name: body.name || triggerName }, { status: 200 });
+      }
 
       let actualPayload: HasuraEventPayload | null = null;
 
@@ -787,6 +1228,12 @@ export async function main() {
   // Synchronize event triggers
   console.log('🔄 Synchronizing Hasura event triggers...');
   debug('Synchronizing event triggers');
+
+  const API_URL = process.env.NEXT_PUBLIC_API_URL || process.env.NEXT_PUBLIC_MAIN_URL || process.env.NEXT_PUBLIC_BASE_URL;
+
+  if (!API_URL) {
+    throw new Error('NEXT_PUBLIC_MAIN_URL | NEXT_PUBLIC_BASE_URL || NEXT_PUBLIC_API_URL is not set');
+  }
   
   try {
     // Determine base URL for webhook
@@ -800,7 +1247,7 @@ export async function main() {
       console.log(`ℹ️ Using base URL for webhooks: ${baseUrl}`);
     }
     
-    await syncEventTriggersFromDirectory(eventsDir, undefined, undefined, baseUrl);
+    await syncAllTriggersFromDirectory(eventsDir, undefined, undefined, baseUrl);
     console.log('✅ Event triggers synchronized successfully!');
     debug('Event triggers synchronized');
   } catch (error) {

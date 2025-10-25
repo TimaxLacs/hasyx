@@ -1,5 +1,16 @@
-const CACHE_NAME = 'hasyx-v1';
-const RUNTIME_CACHE = 'hasyx-runtime-v1';
+// Development mode detection
+const isDevelopment = self.location.hostname === 'localhost' || 
+                     self.location.hostname === '127.0.0.1' || 
+                     self.location.hostname.includes('.local') ||
+                     self.location.port === '3000';
+
+// Disable aggressive caching in development
+const DEVELOPMENT_CACHE_DISABLED = isDevelopment;
+
+console.log('Service Worker mode:', isDevelopment ? 'DEVELOPMENT' : 'PRODUCTION');
+
+const CACHE_NAME = isDevelopment ? `hasyx-dev-${Date.now()}` : 'hasyx-v1';
+const RUNTIME_CACHE = isDevelopment ? `hasyx-runtime-dev-${Date.now()}` : 'hasyx-runtime-v1';
 
 // Static resources to cache immediately
 const STATIC_CACHE_RESOURCES = [
@@ -25,20 +36,23 @@ const RUNTIME_CACHE_PATTERNS = [
   /\.(?:js|css|woff|woff2|ttf|eot)$/,
 ];
 
-// Install event - cache static resources
+// Install event - in development do minimal/no caching
 self.addEventListener('install', (event) => {
-  console.log('Service Worker installing...');
+  console.log('Service Worker installing...', isDevelopment ? '(Development Mode)' : '(Production Mode)');
   
+  if (isDevelopment) {
+    // Do not pre-cache anything in development; activate immediately
+    event.waitUntil(self.skipWaiting());
+    return;
+  }
+
   event.waitUntil(
     caches.open(CACHE_NAME)
       .then((cache) => {
         console.log('Caching static resources');
         return cache.addAll(STATIC_CACHE_RESOURCES);
       })
-      .then(() => {
-        // Force activation of new service worker
-        return self.skipWaiting();
-      })
+      .then(() => self.skipWaiting())
   );
 });
 
@@ -46,41 +60,51 @@ self.addEventListener('install', (event) => {
 self.addEventListener('activate', (event) => {
   console.log('Service Worker activating...');
   
+  if (isDevelopment) {
+    event.waitUntil(
+      (async () => {
+        // Delete all caches and unregister in development
+        const cacheNames = await caches.keys();
+        await Promise.all(cacheNames.map((name) => caches.delete(name)));
+        try { await self.registration.unregister(); } catch {}
+        await self.clients.claim();
+      })()
+    );
+    return;
+  }
+
   event.waitUntil(
     caches.keys()
-      .then((cacheNames) => {
-        return Promise.all(
-          cacheNames.map((cacheName) => {
-            if (cacheName !== CACHE_NAME && cacheName !== RUNTIME_CACHE) {
-              console.log('Deleting old cache:', cacheName);
-              return caches.delete(cacheName);
-            }
-          })
-        );
-      })
-      .then(() => {
-        // Take control of all pages immediately
-        return self.clients.claim();
-      })
+      .then((cacheNames) => Promise.all(
+        cacheNames.map((cacheName) => {
+          if (cacheName !== CACHE_NAME && cacheName !== RUNTIME_CACHE) {
+            console.log('Deleting old cache:', cacheName);
+            return caches.delete(cacheName);
+          }
+        })
+      ))
+      .then(() => self.clients.claim())
   );
 });
 
 // Fetch event - implement caching strategies
 self.addEventListener('fetch', (event) => {
+  if (isDevelopment) {
+    // Do not intercept any requests in development
+    return;
+  }
+
   const { request } = event;
   const url = new URL(request.url);
   
-  // Skip non-GET requests
   if (request.method !== 'GET') {
     return;
   }
   
-  // Skip cross-origin requests unless it's for static assets
   if (url.origin !== location.origin && !isStaticAsset(url.pathname)) {
     return;
   }
   
-  // Handle different request types with appropriate strategies
   if (isAPIRequest(url.pathname)) {
     event.respondWith(networkFirstStrategy(request));
   } else if (isStaticAsset(url.pathname) || isRuntimeCacheable(url.pathname)) {
@@ -153,6 +177,25 @@ async function cacheFirstStrategy(request) {
 
 // Stale While Revalidate Strategy (for pages)
 async function staleWhileRevalidateStrategy(request) {
+  // In development mode - always try network first to get fresh content
+  if (DEVELOPMENT_CACHE_DISABLED) {
+    try {
+      console.log('Development mode: fetching fresh content for', request.url);
+      const networkResponse = await fetch(request);
+      if (networkResponse.ok) {
+        const cache = await caches.open(RUNTIME_CACHE);
+        cache.put(request, networkResponse.clone());
+      }
+      return networkResponse;
+    } catch (error) {
+      console.log('Network failed in development, trying cache for', request.url);
+      // Fallback to cache only if network fails
+      const cachedResponse = await caches.match(request);
+      return cachedResponse || createOfflineFallback(request);
+    }
+  }
+  
+  // Production behavior - serve from cache first, update in background
   const cache = await caches.open(RUNTIME_CACHE);
   const cachedResponse = await cache.match(request);
   

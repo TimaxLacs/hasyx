@@ -23,6 +23,53 @@ The `Hasura` class provides methods for:
 - **Metadata Operations**: Export, import, and manage Hasura metadata
 - **Raw SQL Execution**: Execute custom SQL queries
 
+## One-off Scheduled Events
+
+The Hasura client exposes helpers to manage one-off scheduled events via the Metadata API.
+
+```ts
+// Create a Hasura instance (admin context required)
+const hasura = new Hasura({ url: process.env.NEXT_PUBLIC_HASURA_GRAPHQL_URL!, secret: process.env.HASURA_ADMIN_SECRET! });
+
+// Create (schedule) a one-off event
+await hasura.defineOneOffEvent({
+  webhook: 'https://your-app.com/api/events/one-off',
+  scheduleAtIso: new Date(Date.now() + 60_000).toISOString(), // in 1 minute
+  payload: { client_event_id: 'uuid', schedule_id: null },
+  headers: [
+    { name: 'X-Hasura-Event-Secret', value_from_env: 'HASURA_EVENT_SECRET' },
+  ],
+  retry_conf: { num_retries: 3, timeout_seconds: 60, retry_interval_seconds: 10 },
+});
+
+// Cancel a pending one-off event
+await hasura.undefineOneOffEvent({ event_id: 'event-id-returned-by-hasura-or-found-in-hdb_catalog.hdb_scheduled_events' });
+```
+
+- Database verification tables (read-only):
+  - `hdb_catalog.hdb_scheduled_events` — event state (`id`, `status`, `tries`, `next_retry_at`, `payload`, ...)
+  - `hdb_catalog.hdb_scheduled_event_invocation_logs` — delivery logs (`event_id`, `request`, `response`, `status`, `created_at`)
+
+- Typical verification:
+  - Locate event by `payload ->> 'client_event_id'` in `hdb_catalog.hdb_scheduled_events` and check `status = 'delivered'` after scheduled time, or
+  - Ensure at least one row exists in `hdb_catalog.hdb_scheduled_event_invocation_logs` for the `event_id` with a 200 response.
+
+### Hasyx client convenience helper
+
+The Hasyx client provides a convenience method to schedule a one-off to the current app webhook:
+
+```ts
+await hasyx.scheduleOneOff({
+  scheduleAtEpochSec: Math.floor(Date.now() / 1000) + 60,
+  payload: { client_event_id: 'uuid', schedule_id: null },
+  // optional
+  // webhookPath: '/api/events/one-off',
+  // retry_conf: { num_retries: 3 },
+});
+```
+
+This builds the webhook using base URL variables (`NEXT_PUBLIC_MAIN_URL`/`NEXT_PUBLIC_BASE_URL`) and passes `X-Hasura-Event-Secret` from env when available. These variables are auto-generated from `hasyx.config.json` via `npx hasyx config`. Do not edit `.env` manually; change settings through the configurator.
+
 ## Constructor
 
 ```typescript
@@ -430,4 +477,98 @@ await hasura.defineView({
 });
 ```
 
-### `
+### `deleteView(options: { schema: string; name: string }): Promise<any>`
+
+Delete a database view and untrack it from Hasura.
+
+```typescript
+await hasura.deleteView({
+  schema: 'public',
+  name: 'old_view'
+});
+```
+
+## Relationship Operations
+
+### `defineRelationship(options: DefineUniversalRelationshipOptions): Promise<any>`
+
+Create or replace a relationship between tables (idempotent operation). This is the universal method that can handle both object and array relationships with various configuration options.
+
+```typescript
+// Object relationship using foreign key constraint
+await hasura.defineRelationship({
+  schema: 'public',
+  table: 'posts',
+  name: 'author',
+  type: 'object',
+  using: {
+    foreign_key_constraint_on: 'author_id'
+  }
+});
+
+// Array relationship using foreign key constraint
+await hasura.defineRelationship({
+  schema: 'public',
+  table: 'users',
+  name: 'posts',
+  type: 'array',
+  using: {
+    foreign_key_constraint_on: {
+      table: { schema: 'public', name: 'posts' },
+      column: 'author_id'
+    }
+  }
+});
+
+// Manual relationship configuration
+await hasura.defineRelationship({
+  schema: 'public',
+  table: 'posts',
+  name: 'author',
+  type: 'object',
+  using: {
+    manual_configuration: {
+      remote_table: { schema: 'public', name: 'users' },
+      column_mapping: { author_id: 'id' }
+    }
+  }
+});
+```
+
+### `defineObjectRelationshipForeign(options: DefineRelationshipOptions): Promise<any>`
+
+Create or replace an object relationship using a foreign key constraint (idempotent operation).
+
+```typescript
+await hasura.defineObjectRelationshipForeign({
+  schema: 'public',
+  table: 'posts',
+  name: 'author',
+  key: 'author_id'
+});
+```
+
+### `defineArrayRelationshipForeign(options: DefineRelationshipOptions): Promise<any>`
+
+Create or replace an array relationship using a foreign key constraint (idempotent operation).
+
+```typescript
+await hasura.defineArrayRelationshipForeign({
+  schema: 'public',
+  table: 'users',
+  name: 'posts',
+  key: 'posts.author_id'
+});
+```
+
+### `deleteRelationship(options: DeleteRelationshipOptions): Promise<any>`
+
+Delete a relationship from a table.
+
+```typescript
+await hasura.deleteRelationship({
+  schema: 'public',
+  table: 'posts',
+  name: 'author'
+});
+```

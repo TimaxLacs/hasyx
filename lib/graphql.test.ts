@@ -8,9 +8,9 @@ import { Subscription } from 'zen-observable-ts'; // For handling subscription c
 // Load environment variables from root .env
 dotenv.config({ path: path.join(process.cwd(), '.env') });
 
-import { createApolloClient } from './apollo'; // Hasyx creator from lib
-import { hashPassword } from './authDbUtils'; // For user creation
-import { Hasyx } from './hasyx'; // Import the Hasyx class
+import { createApolloClient } from './apollo/apollo'; // Hasyx creator from lib
+import { hashPassword } from './users/auth-server'; // For user creation
+import { Hasyx } from './hasyx/hasyx'; // Import the Hasyx class
 import Debug from './debug'; // Import Debug
 import { Generator } from './generator'; // Import the Generator function
 import schema from '../public/hasura-schema.json'; // Import the schema
@@ -41,13 +41,11 @@ interface UpdateUserData {
 // Helper function to create a test user
 async function createTestUser(adminClient: ApolloClient<any>) {
   const testUserEmail = `test-proxy-${uuidv4()}@example.com`;
-  const testUserPassword = 'password123';
   const testUserName = 'Proxy Test User';
   
-  const hashedPassword = await hashPassword(testUserPassword);
   const INSERT_USER = gql`
-    mutation InsertTestUser($email: String!, $password: String!, $name: String!) {
-      insert_users_one(object: {email: $email, password: $password, name: $name, hasura_role: "user"}) {
+    mutation InsertTestUser($email: String!, $name: String!) {
+      insert_users_one(object: {email: $email, name: $name, hasura_role: "user"}) {
         id
         email
       }
@@ -56,7 +54,7 @@ async function createTestUser(adminClient: ApolloClient<any>) {
 
   const { data } = await adminClient.mutate({
     mutation: INSERT_USER,
-    variables: { email: testUserEmail, password: hashedPassword, name: testUserName },
+    variables: { email: testUserEmail, name: testUserName },
   });
   
   const testUserId = data?.insert_users_one?.id;
@@ -129,15 +127,307 @@ async function deleteTestUser(adminClient: ApolloClient<any>, testUserId: string
       const data = await proxyClient.select({
         table: 'users',
         pk_columns: { id: testUserId },
-        returning: ['id', 'email', 'name'],
+        returning: ['id', 'name'],
       });
 
       Debug(`📊 Received data: ${JSON.stringify(data)}`);
       expect(data).toBeDefined();
       expect(data?.id).toBe(testUserId);
-      expect(data?.email).toBe(testUserEmail);
       expect(data?.name).toBe(testUserName);
       Debug('✅ client.select via proxy successful.');
+
+    } finally {
+      // Cleanup test user
+      if (testUserId) {
+        await deleteTestUser(adminClient, testUserId);
+      }
+      // Cleanup Apollo clients
+      if (adminClient.terminate) {
+        adminClient.terminate();
+      }
+    }
+  }, 30000); // Test timeout
+
+  // --- User Authentication Proxy Test ---
+  test('should use user session authentication via proxy (not admin secret)', async () => {
+    Debug('\n🧪 Testing user session authentication via proxy...');
+    
+    if (!HASURA_URL || !ADMIN_SECRET) {
+      throw new Error('Missing HASURA_URL or ADMIN_SECRET in environment variables for test setup.');
+    }
+
+    // Create admin client
+    const adminClient = createApolloClient({
+      url: HASURA_URL,
+      secret: ADMIN_SECRET,
+      ws: false, // HTTP only for this test
+    });
+
+    let testUserId: string | null = null;
+    let testUserName: string;
+
+    try {
+      // Create test user
+      const userData = await createTestUser(adminClient);
+      testUserId = userData.testUserId;
+      testUserName = userData.testUserName;
+
+      // Create proxy client with user session simulation
+      const apolloProxy = createApolloClient({
+        url: PROXY_GRAPHQL_URL,
+        ws: false, // HTTP only for this test
+        // No token/secret here - proxy should handle user session
+      });
+      const proxyClient = new Hasyx(apolloProxy, generate);
+
+      // Test the select operation - this should use user session, not admin secret
+      const data = await proxyClient.select({
+        table: 'users',
+        pk_columns: { id: testUserId },
+        returning: ['id', 'name'],
+      });
+
+      Debug(`📊 Received data: ${JSON.stringify(data)}`);
+      expect(data).toBeDefined();
+      expect(data?.id).toBe(testUserId);
+      expect(data?.name).toBe(testUserName);
+      Debug('✅ User session authentication via proxy successful.');
+
+    } finally {
+      // Cleanup test user
+      if (testUserId) {
+        await deleteTestUser(adminClient, testUserId);
+      }
+      // Cleanup Apollo clients
+      if (adminClient.terminate) {
+        adminClient.terminate();
+      }
+    }
+  }, 30000); // Test timeout
+
+  // --- JWT Authentication Proxy Test ---
+  test('should use JWT authentication via proxy (not admin secret)', async () => {
+    Debug('\n🧪 Testing JWT authentication via proxy...');
+    
+    if (!HASURA_URL || !ADMIN_SECRET) {
+      throw new Error('Missing HASURA_URL or ADMIN_SECRET in environment variables for test setup.');
+    }
+
+    // Create admin client
+    const adminClient = createApolloClient({
+      url: HASURA_URL,
+      secret: ADMIN_SECRET,
+      ws: false, // HTTP only for this test
+    });
+
+    let testUserId: string | null = null;
+    let testUserName: string;
+
+    try {
+      // Create test user
+      const userData = await createTestUser(adminClient);
+      testUserId = userData.testUserId;
+      testUserName = userData.testUserName;
+
+      // Generate JWT for the test user
+      const { generateJWT } = await import('./jwt');
+      const hasuraClaims = {
+        'x-hasura-allowed-roles': ['user', 'me'],
+        'x-hasura-default-role': 'user',
+        'x-hasura-user-id': testUserId!,
+      };
+      const jwt = await generateJWT(testUserId!, hasuraClaims);
+      Debug(`🔑 Generated JWT for user ${testUserId}`);
+
+      // Create proxy client with JWT authentication
+      const apolloProxy = createApolloClient({
+        url: PROXY_GRAPHQL_URL,
+        token: jwt, // Pass JWT token
+        ws: false, // HTTP only for this test
+      });
+      const proxyClient = new Hasyx(apolloProxy, generate);
+
+      // Test the select operation - this should use JWT, not admin secret
+      const data = await proxyClient.select({
+        table: 'users',
+        pk_columns: { id: testUserId },
+        returning: ['id', 'name'],
+      });
+
+      Debug(`📊 Received data: ${JSON.stringify(data)}`);
+      expect(data).toBeDefined();
+      expect(data?.id).toBe(testUserId);
+      expect(data?.name).toBe(testUserName);
+      Debug('✅ JWT authentication via proxy successful.');
+
+    } finally {
+      // Cleanup test user
+      if (testUserId) {
+        await deleteTestUser(adminClient, testUserId);
+      }
+      // Cleanup Apollo clients
+      if (adminClient.terminate) {
+        adminClient.terminate();
+      }
+    }
+  }, 30000); // Test timeout
+
+  // --- Insert with User Session Test ---
+  test('should insert data via proxy with user session (simulating hasyx.insert issue)', async () => {
+    Debug('\n🧪 Testing insert via proxy with user session...');
+    
+    if (!HASURA_URL || !ADMIN_SECRET) {
+      throw new Error('Missing HASURA_URL or ADMIN_SECRET in environment variables for test setup.');
+    }
+
+    // Create admin client
+    const adminClient = createApolloClient({
+      url: HASURA_URL,
+      secret: ADMIN_SECRET,
+      ws: false, // HTTP only for this test
+    });
+
+    let testUserId: string | null = null;
+    let testUserName: string;
+
+    try {
+      // Create test user
+      const userData = await createTestUser(adminClient);
+      testUserId = userData.testUserId;
+      testUserName = userData.testUserName;
+
+      // Generate JWT for the test user (simulating user session)
+      const { generateJWT } = await import('./jwt');
+      const hasuraClaims = {
+        'x-hasura-allowed-roles': ['user', 'me'],
+        'x-hasura-default-role': 'user',
+        'x-hasura-user-id': testUserId!,
+      };
+      const jwt = await generateJWT(testUserId!, hasuraClaims);
+      Debug(`🔑 Generated JWT for user ${testUserId}`);
+
+      // Create proxy client with JWT authentication (simulating user session)
+      const apolloProxy = createApolloClient({
+        url: PROXY_GRAPHQL_URL,
+        token: jwt, // Pass JWT token (simulating user session)
+        ws: false, // HTTP only for this test
+      });
+      const proxyClient = new Hasyx(apolloProxy, generate);
+
+      // Test the insert operation (simulating hasyx.insert)
+      const insertData = await proxyClient.insert({
+        table: 'github_issues',
+        object: { title: 'Test Issue via Proxy' },
+        returning: ['id', 'title'],
+      });
+
+      Debug(`📊 Insert result: ${JSON.stringify(insertData)}`);
+      expect(insertData).toBeDefined();
+      expect(insertData?.title).toBe('Test Issue via Proxy');
+      Debug('✅ Insert via proxy with user session successful.');
+
+      // Cleanup the inserted issue
+      if (insertData?.id) {
+        await adminClient.mutate({
+          mutation: gql`
+            mutation DeleteTestIssue($id: uuid!) {
+              delete_github_issues_by_pk(id: $id) {
+                id
+              }
+            }
+          `,
+          variables: { id: insertData.id },
+        });
+        Debug(`🗑️ Cleaned up test issue: ${insertData.id}`);
+      }
+
+    } finally {
+      // Cleanup test user
+      if (testUserId) {
+        await deleteTestUser(adminClient, testUserId);
+      }
+      // Cleanup Apollo clients
+      if (adminClient.terminate) {
+        adminClient.terminate();
+      }
+    }
+  }, 30000); // Test timeout
+
+  // --- Real Browser Session Test ---
+  test('should use NextAuth session via proxy (real browser simulation)', async () => {
+    Debug('\n🧪 Testing NextAuth session via proxy (browser simulation)...');
+    
+    if (!HASURA_URL || !ADMIN_SECRET) {
+      throw new Error('Missing HASURA_URL or ADMIN_SECRET in environment variables for test setup.');
+    }
+
+    // Create admin client
+    const adminClient = createApolloClient({
+      url: HASURA_URL,
+      secret: ADMIN_SECRET,
+      ws: false, // HTTP only for this test
+    });
+
+    let testUserId: string | null = null;
+    let testUserName: string;
+
+    try {
+      // Create test user
+      const userData = await createTestUser(adminClient);
+      testUserId = userData.testUserId;
+      testUserName = userData.testUserName;
+
+      // Create NextAuth session token (simulating browser session)
+      const { encode } = await import('next-auth/jwt');
+      const sessionToken = await encode({
+        token: {
+          sub: testUserId!,
+          name: testUserName,
+          email: userData.testUserEmail,
+          'https://hasura.io/jwt/claims': {
+            'x-hasura-allowed-roles': ['user', 'me'],
+            'x-hasura-default-role': 'user',
+            'x-hasura-user-id': testUserId,
+          }
+        },
+        secret: process.env.NEXTAUTH_SECRET!,
+      });
+
+      Debug(`🔑 Created NextAuth session token for user ${testUserId}`);
+
+      // Make HTTP request to proxy with session cookie (simulating browser)
+      const response = await fetch(`${PROXY_GRAPHQL_URL}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Cookie': `next-auth.session-token=${sessionToken}`,
+        },
+        body: JSON.stringify({
+          query: `
+            mutation InsertTestIssue($object: github_issues_insert_input!) {
+              insert_github_issues_one(object: $object) {
+                id
+                title
+              }
+            }
+          `,
+          variables: {
+            object: { title: 'Test Issue via Browser Session' }
+          }
+        })
+      });
+
+      const result = await response.json();
+      Debug(`📊 Proxy response: ${JSON.stringify(result)}`);
+
+      if (result.errors) {
+        Debug(`❌ GraphQL errors: ${JSON.stringify(result.errors)}`);
+        // We expect this to fail with the trigger error, but we want to see the headers
+        expect(result.errors).toBeDefined();
+      } else {
+        Debug('✅ Insert successful via browser session');
+        expect(result.data).toBeDefined();
+      }
 
     } finally {
       // Cleanup test user

@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import http from 'http';
 import ws, { WebSocket, WebSocketServer } from 'ws';
 import { getToken } from 'next-auth/jwt';
+import { getTokenFromIncomingMessage, getTokenFromRequest } from './users/auth-next';
 import Debug from './debug';
 import { generateJWT } from 'hasyx/lib/jwt';
 
@@ -116,18 +117,115 @@ export async function proxyPOST(request: NextRequest): Promise<NextResponse> {
       'Content-Type': 'application/json',
     };
 
-    if (!HASURA_ADMIN_SECRET) {
-      const errorMsg = 'HASURA_ADMIN_SECRET is not configured on the server for HTTP proxy.';
-      console.error(`❌ ${errorMsg}`);
-      debug(`❌ ${errorMsg}`);
-      return NextResponse.json({ errors: [{ message: errorMsg }] }, {
-        status: 500,
-        headers: corsHeaders
-      });
-      // Important: Do not proceed if admin secret is missing for POST
+    // Check for JWT token in Authorization header first
+    const authHeader = request.headers.get('authorization');
+    let useJwt = false;
+    
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      const jwtToken = authHeader.substring(7); // Remove 'Bearer ' prefix
+      debug('🔓 Found Bearer token in Authorization header (JWT auth)');
+      
+      try {
+        // Validate the JWT structure
+        const [, payloadB64] = jwtToken.split('.');
+        const payload = JSON.parse(Buffer.from(payloadB64, 'base64').toString());
+        const hasuraClaims = payload['https://hasura.io/jwt/claims'];
+        
+        if (hasuraClaims) {
+          debug('✅ Valid JWT found with Hasura claims');
+          debug(`👤 JWT user ID: ${hasuraClaims['x-hasura-user-id']}`);
+          debug(`🏷️ JWT role: ${hasuraClaims['x-hasura-default-role']}`);
+          
+          // Use the JWT directly
+          headers['Authorization'] = authHeader;
+          useJwt = true;
+          debug('🔑 Using JWT for downstream HTTP request.');
+        }
+      } catch (jwtError: any) {
+        debug('❌ Invalid JWT format:', jwtError);
+      }
     }
-    headers['x-hasura-admin-secret'] = HASURA_ADMIN_SECRET;
-    debug('🔑 Using Hasura Admin Secret for downstream HTTP request.');
+    
+    if (!useJwt) {
+      // Fall back to NextAuth cookie authentication (same logic as WebSocket)
+      debug('🔍 No JWT in Authorization header, checking NextAuth session...');
+      try {
+        const token = await getTokenFromRequest(request) as NextAuthToken | null;
+        
+        debug('🎫 getTokenFromRequest result:', {
+          hasToken: !!token,
+          hasSub: !!token?.sub,
+          tokenType: typeof token,
+          sub: token?.sub,
+          provider: token?.provider,
+          hasHasuraClaims: !!(token as any)?.['https://hasura.io/jwt/claims']
+        });
+
+        if (token?.sub) {
+          debug(`👤 User authenticated (ID: ${token.sub}). Generating Hasura JWT.`);
+          debug('🔑 === JWT GENERATION FOR AUTHENTICATED USER ===');
+          try {
+            const hasuraClaims = {
+              'x-hasura-allowed-roles': ['user', 'anonymous', 'me'], // Keep fixed roles for simplicity in proxy
+              'x-hasura-default-role': 'user',
+              'x-hasura-user-id': token.sub,
+            };
+            debug('🏷️ Hasura claims for user:', hasuraClaims);
+            
+            const jwt = await generateJWT(token.sub, hasuraClaims);
+            headers['Authorization'] = `Bearer ${jwt}`;
+            useJwt = true;
+            debug('🔑 Using generated JWT (user role) for downstream HTTP request.');
+            debug(`📝 JWT header added: Authorization: Bearer ${jwt.substring(0, 50)}...`);
+          } catch (jwtError: any) {
+            console.error('❌ Failed to generate Hasura JWT for user:', jwtError);
+            debug('❌ Failed to generate Hasura JWT for user:', jwtError.message);
+            debug('❌ JWT Error stack:', jwtError.stack);
+          }
+        } else {
+          // Generate Anonymous JWT instead of using Admin Secret
+          debug('👤 User not authenticated. Generating Anonymous JWT.');
+          debug('🔑 === JWT GENERATION FOR ANONYMOUS USER ===');
+          try {
+            const anonymousUserId = `anon-${Date.now()}`; // Create a unique ID for anonymous user
+            const hasuraClaims = {
+              'x-hasura-allowed-roles': ['anonymous'], // Only allow anonymous role
+              'x-hasura-default-role': 'anonymous',
+              'x-hasura-user-id': anonymousUserId, // Provide an ID
+            };
+            debug('🏷️ Hasura claims for anonymous:', hasuraClaims);
+            
+            const jwt = await generateJWT(anonymousUserId, hasuraClaims);
+            headers['Authorization'] = `Bearer ${jwt}`;
+            useJwt = true;
+            debug('🔑 Using generated JWT (anonymous role) for downstream HTTP request.');
+            debug(`📝 JWT header added: Authorization: Bearer ${jwt.substring(0, 50)}...`);
+          } catch (jwtError: any) {
+            console.error('❌ Failed to generate Hasura JWT for anonymous:', jwtError);
+            debug('❌ Failed to generate Hasura JWT for anonymous:', jwtError.message);
+            debug('❌ JWT Error stack:', jwtError.stack);
+          }
+        }
+      } catch (sessionError: any) {
+        debug('❌ Error checking user session:', sessionError.message);
+      }
+    }
+    
+    if (!useJwt) {
+      // Fall back to admin secret if no valid JWT or session
+      if (!HASURA_ADMIN_SECRET) {
+        const errorMsg = 'HASURA_ADMIN_SECRET is not configured on the server for HTTP proxy.';
+        console.error(`❌ ${errorMsg}`);
+        debug(`❌ ${errorMsg}`);
+        return NextResponse.json({ errors: [{ message: errorMsg }] }, {
+          status: 500,
+          headers: corsHeaders
+        });
+        // Important: Do not proceed if admin secret is missing for POST
+      }
+      headers['x-hasura-admin-secret'] = HASURA_ADMIN_SECRET;
+      debug('🔑 Using Hasura Admin Secret for downstream HTTP request.');
+    }
 
     debug(`🔗 Sending request to Hasura HTTP: ${HASURA_ENDPOINT}`);
     const hasuraResponse = await fetch(HASURA_ENDPOINT, {
@@ -259,19 +357,52 @@ export async function proxySOCKET(
 
   try {
     debug(`🔐 [${clientId}] === AUTHENTICATION FLOW START ===`);
-    const token = await getToken({
-      req: request as any,
-      secret: NEXTAUTH_SECRET
-    }) as NextAuthToken | null;
+    
+    // Check for JWT token in Authorization header first
+    const authHeader = request.headers.authorization;
+    let jwtToken: string | null = null;
+    
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      jwtToken = authHeader.substring(7); // Remove 'Bearer ' prefix
+      debug(`🔓 [${clientId}] Found Bearer token in Authorization header (JWT auth)`);
+      
+      try {
+        // Validate the JWT structure
+        const [, payloadB64] = jwtToken.split('.');
+        const payload = JSON.parse(Buffer.from(payloadB64, 'base64').toString());
+        const hasuraClaims = payload['https://hasura.io/jwt/claims'];
+        
+        if (hasuraClaims) {
+          debug(`✅ [${clientId}] Valid JWT found with Hasura claims`);
+          debug(`👤 [${clientId}] JWT user ID: ${hasuraClaims['x-hasura-user-id']}`);
+          debug(`🏷️ [${clientId}] JWT role: ${hasuraClaims['x-hasura-default-role']}`);
+        }
+      } catch (jwtError: any) {
+        debug(`❌ [${clientId}] Invalid JWT format:`, jwtError.message);
+        jwtToken = null;
+      }
+    }
+    
+    const headers: Record<string, string> = {};
+    
+    if (jwtToken) {
+      // Use JWT directly
+      headers['Authorization'] = `Bearer ${jwtToken}`;
+      debug(`🔑 [${clientId}] Using JWT for Hasura WS connection.`);
+      debug(`📝 [${clientId}] JWT header added: Authorization: Bearer ${jwtToken.substring(0, 50)}...`);
+    } else {
+      // Fall back to NextAuth cookie authentication
+    // Use getTokenFromIncomingMessage for better WebSocket cookie parsing
+    const token = await getTokenFromIncomingMessage(request) as NextAuthToken | null;
 
-    debug(`🎫 [${clientId}] getToken result:`, {
+    debug(`🎫 [${clientId}] getTokenFromIncomingMessage result:`, {
       hasToken: !!token,
       hasSub: !!token?.sub,
       tokenType: typeof token,
-      sub: token?.sub
+      sub: token?.sub,
+      provider: token?.provider,
+      hasHasuraClaims: !!(token as any)?.['https://hasura.io/jwt/claims']
     });
-
-    const headers: Record<string, string> = {};
 
     if (token?.sub) {
       debug(`👤 [${clientId}] User authenticated (ID: ${token.sub}). Generating Hasura JWT.`);
@@ -321,6 +452,7 @@ export async function proxySOCKET(
         return;
       }
       // --- MODIFICATION END ---
+      }
     }
 
     debug(`🔐 [${clientId}] === AUTHENTICATION FLOW END ===`);
@@ -432,7 +564,7 @@ export async function proxySOCKET(
         return;
       }
       try {
-        const messageStr = message.toString();
+        let messageStr = message.toString();
         const parsedMessage = JSON.parse(messageStr);
         const type = parsedMessage.type;
 
@@ -484,7 +616,17 @@ export async function proxySOCKET(
         // === DEBUG: Special handling for error messages ===
         if (type === 'error') {
           debug(`❌ [${clientId}] === ERROR MESSAGE FROM HASURA ===`);
-          debug(`📋 [${clientId}] Error details:`, parsedMessage.payload);
+          debug(`📋 [${clientId}] Original error payload:`, parsedMessage.payload);
+
+          // FIX: Normalize Hasura's error payload.
+          // Hasura sometimes sends { "errors": [...] } which is not compliant.
+          // The graphql-transport-ws spec expects payload to be an array of errors.
+          if (parsedMessage.payload && typeof parsedMessage.payload === 'object' && Array.isArray(parsedMessage.payload.errors)) {
+            debug(`⚠️ [${clientId}] Re-formatting non-compliant error payload to be an array.`);
+            parsedMessage.payload = parsedMessage.payload.errors;
+            messageStr = JSON.stringify(parsedMessage);
+          }
+          
           if (parsedMessage.payload && parsedMessage.payload.errors) {
             debug(`🔍 [${clientId}] GraphQL errors:`, parsedMessage.payload.errors);
             parsedMessage.payload.errors.forEach((error: any, index: number) => {
@@ -502,7 +644,8 @@ export async function proxySOCKET(
           parsedMessage.type = 'next';
           messageToSend = JSON.stringify(parsedMessage);
         } else if (type === 'error') {
-          debug(`❗ [${clientId}] Forwarding error H -> C`);
+          // The error payload is now corrected above, so we just forward it.
+          debug(`❗ [${clientId}] Forwarding corrected error H -> C`);
         } else if (type === 'complete') {
           debug(`✅ [${clientId}] Forwarding complete H -> C`);
         } else {

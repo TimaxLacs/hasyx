@@ -1,0 +1,527 @@
+#!/usr/bin/env node
+
+import * as path from 'path';
+
+import { sendTelegramMessage } from '../telegram/telegram-bot';
+import { Dialog } from '../ai/dialog';
+import { OpenRouterProvider } from '../ai/providers/openrouter';
+import Debug from '../debug';
+import { AIMessage } from '../ai/ai';
+
+const debug = Debug('hasyx:github-telegram-bot');
+
+export interface GithubCommitInfo {
+  sha: string;
+  shortSha: string;
+  message: string;
+  author: string;
+  authorEmail: string;
+  timestamp: string;
+  url: string;
+  filesChanged: number;
+  additions: number;
+  deletions: number;
+}
+
+export interface WorkflowStatus {
+  test: 'success' | 'failure' | 'cancelled' | 'skipped' | 'in_progress' | 'queued' | 'unknown';
+  publish: 'success' | 'failure' | 'cancelled' | 'skipped' | 'in_progress' | 'queued' | 'unknown';
+  deploy: 'success' | 'failure' | 'cancelled' | 'skipped' | 'in_progress' | 'queued' | 'unknown';
+  android: 'success' | 'failure' | 'cancelled' | 'skipped' | 'in_progress' | 'queued' | 'unknown';
+  release: 'success' | 'failure' | 'cancelled' | 'skipped' | 'in_progress' | 'queued' | 'unknown';
+}
+
+export interface GithubTelegramBotOptions {
+  commitSha?: string;
+  githubToken?: string;
+  telegramBotToken?: string;
+  repositoryUrl?: string;
+  enabled?: boolean | string | number;
+  systemPrompt: string; // Required prompt parameter
+
+  // New properties to replace process.env and pckg
+  telegramChannelId?: string; // Single channel for GitHub notifications
+  openRouterApiKey?: string;
+  projectName?: string;
+  projectVersion?: string;
+  projectDescription?: string;
+  projectHomepage?: string;
+}
+
+/**
+ * Fetches commit information from GitHub API
+ */
+async function fetchCommitInfo(commitSha: string, repoUrl: string, githubToken?: string): Promise<GithubCommitInfo> {
+  console.log(`🔍 Fetching commit info for SHA: ${commitSha}`);
+  console.log(`📂 Repository URL: ${repoUrl}`);
+  
+  // Extract owner/repo from URL
+  const match = repoUrl.match(/github\.com\/([^\/]+)\/([^\/\.]+)/);
+  if (!match) {
+    throw new Error(`Invalid repository URL format: ${repoUrl}`);
+  }
+  
+  const [, owner, repo] = match;
+  
+  // First, resolve the commit SHA if it's short
+  let fullSha = commitSha;
+  if (commitSha.length < 40) {
+    console.log(`🔗 Resolving short SHA to full SHA...`);
+    const resolveUrl = `https://api.github.com/repos/${owner}/${repo}/commits/${commitSha}`;
+    const headers: Record<string, string> = {
+      'Accept': 'application/vnd.github.v3+json',
+      'User-Agent': 'hasyx-github-telegram-bot'
+    };
+    
+    if (githubToken) {
+      headers['Authorization'] = `token ${githubToken}`;
+    }
+    
+    const resolveResponse = await fetch(resolveUrl, { headers });
+    if (resolveResponse.ok) {
+      const resolveData = await resolveResponse.json();
+      fullSha = resolveData.sha;
+      console.log(`✅ Resolved to full SHA: ${fullSha}`);
+    }
+  }
+  
+  const apiUrl = `https://api.github.com/repos/${owner}/${repo}/commits/${fullSha}`;
+  
+  console.log(`🌐 GitHub API URL: ${apiUrl}`);
+  
+  const headers: Record<string, string> = {
+    'Accept': 'application/vnd.github.v3+json',
+    'User-Agent': 'hasyx-github-telegram-bot'
+  };
+  
+  if (githubToken) {
+    headers['Authorization'] = `token ${githubToken}`;
+    console.log(`🔑 Using GitHub token for authentication`);
+  } else {
+    console.log(`⚠️ No GitHub token provided - using unauthenticated requests (rate limited)`);
+  }
+  
+  const response = await fetch(apiUrl, { headers });
+  
+  if (!response.ok) {
+    console.error(`❌ GitHub API error: ${response.status} ${response.statusText}`);
+    throw new Error(`GitHub API error: ${response.status} ${response.statusText}`);
+  }
+  
+  const data = await response.json();
+  console.log(`✅ Successfully fetched commit data from GitHub API`);
+  
+  const commitInfo: GithubCommitInfo = {
+    sha: data.sha, // Now this is guaranteed to be full SHA
+    shortSha: data.sha.substring(0, 7),
+    message: data.commit.message,
+    author: data.commit.author.name,
+    authorEmail: data.commit.author.email,
+    timestamp: data.commit.author.date,
+    url: data.html_url,
+    filesChanged: data.files?.length || 0,
+    additions: data.stats?.additions || 0,
+    deletions: data.stats?.deletions || 0
+  };
+  
+  console.log(`📊 Commit stats: ${commitInfo.filesChanged} files, +${commitInfo.additions}/-${commitInfo.deletions} lines`);
+  return commitInfo;
+}
+
+/**
+ * Fetches workflow runs status from GitHub API with detailed job information
+ */
+async function fetchWorkflowStatus(commitSha: string, repoUrl: string, githubToken?: string): Promise<WorkflowStatus & { details: any }> {
+  console.log(`🔄 Fetching workflow status for commit: ${commitSha}`);
+  
+  const match = repoUrl.match(/github\.com\/([^\/]+)\/([^\/\.]+)/);
+  if (!match) {
+    throw new Error(`Invalid repository URL format: ${repoUrl}`);
+  }
+  
+  const [, owner, repo] = match;
+  // Use the full SHA for API call
+  const apiUrl = `https://api.github.com/repos/${owner}/${repo}/actions/runs?head_sha=${commitSha}`;
+  
+  console.log(`🌐 Workflows API URL: ${apiUrl}`);
+  
+  const headers: Record<string, string> = {
+    'Accept': 'application/vnd.github.v3+json',
+    'User-Agent': 'hasyx-github-telegram-bot'
+  };
+  
+  if (githubToken) {
+    headers['Authorization'] = `token ${githubToken}`;
+  }
+  
+  const response = await fetch(apiUrl, { headers });
+  
+  if (!response.ok) {
+    console.error(`❌ GitHub Workflows API error: ${response.status} ${response.statusText}`);
+    if (response.status === 403) {
+      console.warn(`⚠️ This likely means the GITHUB_TOKEN lacks 'actions:read' permissions for private repositories`);
+      console.warn(`💡 For private repos, ensure the token has workflow read permissions`);
+    }
+    // Return unknown status with complete structure instead of throwing
+    return {
+      test: 'unknown',
+      publish: 'unknown', 
+      deploy: 'unknown',
+      android: 'unknown',
+      release: 'unknown',
+      details: {
+        error: `GitHub API error: ${response.status}`,
+        workflows: [],
+        testResults: null,
+        publishResults: null,
+        deployResults: null,
+        androidResults: null,
+        releaseResults: null,
+        summary: {
+          totalWorkflows: 0,
+          successfulWorkflows: 0,
+          failedWorkflows: 0,
+          testFailures: [],
+          publishDetails: null,
+          deployUrl: null,
+          androidArtifacts: null,
+          releaseArtifacts: null
+        }
+      }
+    };
+  }
+  
+  const data = await response.json();
+  console.log(`📈 Found ${data.workflow_runs?.length || 0} workflow runs for this commit`);
+  
+  const status: WorkflowStatus & { details: any } = {
+    test: 'unknown',
+    publish: 'unknown',
+    deploy: 'unknown',
+    android: 'unknown',
+    release: 'unknown',
+    details: {
+      workflows: [],
+      testResults: null,
+      publishResults: null,
+      deployResults: null,
+      androidResults: null,
+      releaseResults: null,
+      summary: {
+        totalWorkflows: 0,
+        successfulWorkflows: 0,
+        failedWorkflows: 0,
+        testFailures: [],
+        publishDetails: null,
+        deployUrl: null,
+        androidArtifacts: null,
+        releaseArtifacts: null
+      }
+    }
+  };
+  
+  if (data.workflow_runs && data.workflow_runs.length > 0) {
+    status.details.summary.totalWorkflows = data.workflow_runs.length;
+    
+    // Process each workflow run
+    for (const run of data.workflow_runs) {
+      const workflowName = run.name?.toLowerCase() || '';
+      const conclusion = run.conclusion || run.status;
+      
+      console.log(`📋 Workflow "${run.name}": ${run.status}/${run.conclusion}`);
+      
+      // Track success/failure counts
+      if (conclusion === 'success') {
+        status.details.summary.successfulWorkflows++;
+      } else if (conclusion === 'failure') {
+        status.details.summary.failedWorkflows++;
+      }
+      
+      // Get detailed job information
+      try {
+        const jobsResponse = await fetch(`${run.url}/jobs`, { headers });
+        if (jobsResponse.ok) {
+          const jobsData = await jobsResponse.json();
+          
+          const workflowDetails = {
+            name: run.name,
+            status: run.status,
+            conclusion: run.conclusion,
+            url: run.html_url,
+            duration: run.updated_at && run.created_at ? 
+              Math.round((new Date(run.updated_at).getTime() - new Date(run.created_at).getTime()) / 1000) : null,
+            jobs: jobsData.jobs?.map((job: any) => ({
+              name: job.name,
+              status: job.status,
+              conclusion: job.conclusion,
+              duration: job.completed_at && job.started_at ?
+                Math.round((new Date(job.completed_at).getTime() - new Date(job.started_at).getTime()) / 1000) : null,
+              steps: job.steps?.map((step: any) => ({
+                name: step.name,
+                status: step.status,
+                conclusion: step.conclusion,
+                number: step.number,
+                duration: step.completed_at && step.started_at ?
+                  Math.round((new Date(step.completed_at).getTime() - new Date(step.started_at).getTime()) / 1000) : null
+              }))
+            })) || []
+          };
+          
+          status.details.workflows.push(workflowDetails);
+
+          // Analyze jobs within this workflow run to determine statuses
+          for (const job of jobsData.jobs || []) {
+            const jobName = (job.name || '').toLowerCase();
+            const jobResult = (job.conclusion || job.status || 'unknown') as WorkflowStatus['test'];
+
+            const buildResultDetail = {
+              status: job.status,
+              conclusion: job.conclusion,
+              name: job.name,
+              duration: job.completed_at && job.started_at ?
+                Math.round((new Date(job.completed_at).getTime() - new Date(job.started_at).getTime()) / 1000) : null
+            };
+
+            if (jobName === 'test') {
+              status.test = jobResult;
+              status.details.testResults = buildResultDetail;
+
+              if (job.conclusion === 'failure' && Array.isArray(job.steps)) {
+                const failureSteps = job.steps
+                  .filter((step: any) => step.conclusion === 'failure')
+                  .map((step: any) => ({ stepName: step.name, workflowName: run.name }));
+                status.details.summary.testFailures.push(...failureSteps);
+              }
+            }
+
+            if (jobName === 'npm-publish') {
+              status.publish = jobResult;
+              status.details.publishResults = buildResultDetail;
+            }
+
+            if (jobName === 'deploy-nextjs') {
+              status.deploy = jobResult;
+              status.details.deployResults = buildResultDetail;
+
+              if (job.conclusion === 'success') {
+                const projectName = repoUrl.match(/github\.com\/[^\/]+\/([^\/\.]+)/)?.[1];
+                const ownerName = repoUrl.match(/github\.com\/([^\/]+)\/[^\/\.]+/)?.[1];
+                if (projectName && ownerName) {
+                  status.details.summary.deployUrl = `https://${ownerName}.github.io/${projectName}`;
+                }
+              }
+            }
+
+            if (jobName === 'android-build') {
+              status.android = jobResult;
+              status.details.androidResults = buildResultDetail;
+
+              const uploadedApkStep = (job.steps || []).find((s: any) => (s.name || '').toLowerCase().includes('upload android apk'));
+              if ((job.conclusion === 'success') || (uploadedApkStep && uploadedApkStep.conclusion === 'success')) {
+                status.details.summary.androidArtifacts = {
+                  apkBuilt: true,
+                  aabBuilt: false,
+                  message: 'Android APK built successfully! 📱'
+                };
+              }
+            }
+
+            if (jobName === 'create-release') {
+              status.release = jobResult;
+              status.details.releaseResults = buildResultDetail;
+
+              const uploadedToRelease = (job.steps || []).find((s: any) => (s.name || '').toLowerCase().includes('upload apk to release'));
+              if ((job.conclusion === 'success') || (uploadedToRelease && uploadedToRelease.conclusion === 'success')) {
+                status.details.summary.releaseArtifacts = {
+                  releaseCreated: true,
+                  apkAttached: Boolean(uploadedToRelease ? uploadedToRelease.conclusion === 'success' : true),
+                  aabAttached: false,
+                  message: 'GitHub Release created with artifacts! 🎯'
+                };
+              }
+            }
+          }
+        }
+      } catch (jobError) {
+        console.warn(`⚠️ Failed to fetch jobs for workflow ${run.name}:`, jobError);
+      }
+    }
+  }
+  
+  console.log(`✅ Workflow status analysis complete: Tests ${status.test}, Publish ${status.publish}, Deploy ${status.deploy}`);
+  return status;
+}
+
+/**
+ * Generates AI-powered commit notification message using the new Dialog system
+ */
+export async function askGithubTelegramBot(options: GithubTelegramBotOptions): Promise<string> {
+  const {
+    commitSha = process.env.GITHUB_SHA,
+    githubToken = process.env.GITHUB_TOKEN,
+    repositoryUrl,
+    systemPrompt,
+    openRouterApiKey = process.env.OPENROUTER_API_KEY,
+    projectName = 'Unknown Project',
+    projectVersion,
+    projectDescription,
+    projectHomepage,
+  } = options;
+  
+  debug(`🤖 Generating AI-powered commit notification message...`);
+  
+  if (!commitSha || !repositoryUrl || !systemPrompt || !openRouterApiKey) {
+    throw new Error('Missing required options for askGithubTelegramBot');
+  }
+
+  const commitInfo = await fetchCommitInfo(commitSha, repositoryUrl, githubToken);
+  const workflowStatus = await fetchWorkflowStatus(commitInfo.sha, repositoryUrl, githubToken);
+  const webRepoUrl = repositoryUrl.replace(/\.git$/, '');
+  
+  const provider = new OpenRouterProvider({ 
+    token: openRouterApiKey,
+    model: 'deepseek/deepseek-chat-v3-0324:free',
+  });
+  
+  const getStatusEmoji = (status: string) => {
+    switch (status) {
+      case 'success': return '✅';
+      case 'failure': return '❌';
+      case 'cancelled': return '⏹️';
+      case 'skipped': return '⏭️';
+      case 'in_progress': return '🔄';
+      case 'queued': return '⏳';
+      default: return '⚪';
+    }
+  };
+
+  const userContent = `
+**Project Information:**
+- Name: ${projectName}
+- Version: ${projectVersion || 'N/A'}
+- Description: ${projectDescription || 'No description'}
+- Repository: ${webRepoUrl}
+- Homepage: ${projectHomepage || 'Homepage not available'}
+
+**Commit Details (Focus on what was ACCOMPLISHED):**
+- SHA: ${commitInfo.sha}
+- Short SHA: ${commitInfo.shortSha}
+- Message: ${commitInfo.message}
+- Timestamp: ${commitInfo.timestamp}
+- Files Changed: ${commitInfo.filesChanged}
+- Lines Added: ${commitInfo.additions}
+- Lines Deleted: ${commitInfo.deletions}
+- URL: ${commitInfo.url}
+
+**STRICT WORKFLOW STATUS REPORTING - MANDATORY:**
+- Tests: ${workflowStatus.test} ${getStatusEmoji(workflowStatus.test)} (REQUIRED: explicitly state "PASSED" or "FAILED")
+- Build/Publishing: ${workflowStatus.publish} ${getStatusEmoji(workflowStatus.publish)} (REQUIRED: explicitly state "PASSED" or "FAILED")
+- Deployment: ${workflowStatus.deploy} ${getStatusEmoji(workflowStatus.deploy)} (REQUIRED: explicitly state "PASSED" or "FAILED")
+- Android Build: ${workflowStatus.android} ${getStatusEmoji(workflowStatus.android)} (REQUIRED: explicitly state "PASSED" or "FAILED")
+- GitHub Release: ${workflowStatus.release} ${getStatusEmoji(workflowStatus.release)} (REQUIRED: explicitly state "PASSED" or "FAILED")
+
+**All Workflows Summary:**
+${workflowStatus.details.workflows.map(w => 
+  `- ${w.name}: ${w.conclusion} ${getStatusEmoji(w.conclusion)} (${w.duration}s)`
+).join('\n')}
+
+**Android Build Details:**
+${workflowStatus.details.androidResults ? 
+  `- Status: ${workflowStatus.details.androidResults.status} ${getStatusEmoji(workflowStatus.details.androidResults.status)}
+- Duration: ${workflowStatus.details.androidResults.duration}s
+- APK: ✅ Built successfully
+- AAB: ✅ Built successfully` : 
+  '- Android build not found or not completed'}
+
+**GitHub Release Details:**
+${workflowStatus.details.releaseResults ? 
+  `- Status: ${workflowStatus.details.releaseResults.status} ${getStatusEmoji(workflowStatus.details.releaseResults.status)}
+- Duration: ${workflowStatus.details.releaseResults.duration}s
+- Release: ✅ Created successfully
+- APK: ✅ Attached to release
+- AAB: ✅ Attached to release` : 
+  '- GitHub Release not found or not completed'}
+
+**MANDATORY LINKS AT THE END**:
+🔗 Repository: ${webRepoUrl}
+📚 Documentation: ${projectHomepage || 'https://hasyx.deep.foundation/'}
+📱 Android Build: ${webRepoUrl}/actions/workflows/workflow.yml
+🎯 GitHub Release: ${webRepoUrl}/releases
+`;
+
+  return new Promise<string>((resolve, reject) => {
+    let fullResponse = '';
+    const dialog = new Dialog({
+      provider,
+      systemPrompt,
+      onChange: (event) => {
+        if (event.type === 'ai_response') {
+          fullResponse = event.content;
+        }
+        if (event.type === 'done') {
+          debug(`✅ AI generated message successfully. Length: ${fullResponse.length} chars`);
+          resolve(fullResponse);
+        }
+      },
+      onError: (error) => {
+        debug(`💥 Error during AI message generation:`, error);
+        reject(error);
+      },
+    });
+
+    const userMessage: AIMessage = { role: 'user', content: userContent };
+    
+    debug(`🧠 Sending context to AI for message generation...`);
+    dialog.ask(userMessage);
+  });
+}
+
+/**
+ * Function generator that creates a configured GitHub Telegram Bot handler
+ */
+export function newGithubTelegramBot(options: GithubTelegramBotOptions) {
+  return async function handleGithubTelegramBot(): Promise<{ success: boolean; message: string; chatsSent: number }> {
+    const {
+      commitSha = process.env.GITHUB_SHA,
+      telegramBotToken = process.env.TELEGRAM_BOT_TOKEN,
+      enabled = process.env.HASYX_GITHUB_TELEGRAM_BOT,
+      telegramChannelId = process.env.TELEGRAM_CHANNEL_ID,
+    } = options;
+    
+    debug(`🚀 Starting GitHub Telegram Bot notification process...`);
+    
+    if (!enabled || (enabled !== '1' && enabled !== '2' && enabled !== 1 && enabled !== 2)) {
+      debug(`⏭️ GitHub Telegram Bot is disabled (HASYX_GITHUB_TELEGRAM_BOT=${enabled})`);
+      return { success: true, message: 'GitHub Telegram Bot is disabled', chatsSent: 0 };
+    }
+    
+    if (!commitSha || !telegramBotToken || !telegramChannelId) {
+      const errorMsg = 'Missing one of required vars: GITHUB_SHA, TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID';
+      console.error(`❌ ${errorMsg}`);
+      return { success: false, message: errorMsg, chatsSent: 0 };
+    }
+    
+    try {
+      debug(`🤖 Generating notification message...`);
+      const message = await askGithubTelegramBot(options);
+      
+      debug(`📤 Sending notification to channel: ${telegramChannelId}`);
+      await sendTelegramMessage(telegramBotToken, telegramChannelId, message, { parse_mode: 'Markdown' });
+      
+      debug(`🎉 Notification process completed successfully`);
+      return { 
+        success: true, 
+        message: `Notification sent to channel: ${telegramChannelId}`, 
+        chatsSent: 1 
+      };
+      
+    } catch (error) {
+      debug(`💥 Error in GitHub Telegram Bot process:`, error);
+      return { 
+        success: false, 
+        message: error instanceof Error ? error.message : String(error), 
+        chatsSent: 0 
+      };
+    }
+  };
+} 

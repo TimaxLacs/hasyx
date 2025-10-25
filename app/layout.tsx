@@ -1,29 +1,32 @@
-'use client'; // Layout must be client-side due to providers
-
-import { HasyxProvider } from "hasyx";
-import { PWAInstallPrompt, PWAStatus } from "hasyx/components/pwa-install-prompt";
 import "@/app/globals.css";
-import "hasyx/lib/styles.css";
-import { Generator } from "hasyx";
-import schema from "../public/hasura-schema.json";
+import { AppClientLayout } from '@/lib/app-client-layout';
 
 import cytoscape from 'cytoscape';
-import dagre from 'cytoscape-dagre';
 import cola from 'cytoscape-cola';
-import edgehandles from 'cytoscape-edgehandles';
+import dagre from 'cytoscape-dagre';
 import edgeConnections from 'cytoscape-edge-connections';
+import edgehandles from 'cytoscape-edgehandles';
+import klay from 'cytoscape-klay';
+import { getLocale } from 'hasyx/lib/i18n';
+import schema from "../public/hasura-schema.json";
 
+
+cytoscape.use(klay);
 cytoscape.use(dagre);
 cytoscape.use(cola);
 cytoscape.use(edgeConnections);
 cytoscape.use(edgehandles);
 
-const generate = Generator(schema);
+const defaultLocale = getLocale();
 
-export default function RootLayout({ children }: { children: React.ReactNode }) {
+export default function RootLayout({
+  children,
+}: {
+  children?: any;
+}) {
   return (
     <>
-      <html lang="en" suppressHydrationWarning>
+      <html lang={defaultLocale} suppressHydrationWarning>
         <head>
           {/* Favicon */}
           <link rel="icon" href="/favicon.ico" sizes="any" />
@@ -66,13 +69,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
         </head>
         <body>
-          <HasyxProvider generate={generate}>
+          <AppClientLayout defaultLocale={defaultLocale} schema={schema} defaultTheme={'system'}>
             {children}
-            
-            {/* PWA Components - available on all pages */}
-            <PWAInstallPrompt />
-            <PWAStatus />
-          </HasyxProvider>
+          </AppClientLayout>
         </body>
       </html>
     </>

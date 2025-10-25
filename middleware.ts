@@ -5,7 +5,6 @@ import { corsHeaders } from './lib/graphql-proxy';
 
 const debug = Debug('middleware');
 
-// This function can be marked `async` if using `await` inside
 export function middleware(request: NextRequest) {
   if (
     request.nextUrl.protocol === 'http:' && 
@@ -34,7 +33,7 @@ export function middleware(request: NextRequest) {
   }
   
   // Skip API routes in static builds
-  const isStaticBuild = process.env.npm_lifecycle_event === 'build:client';
+  const isStaticBuild = process.env.npm_lifecycle_event === 'client';
   
   if (isStaticBuild && isApiRoute) {
     // In static builds, skip API routes by returning early

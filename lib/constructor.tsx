@@ -2,7 +2,7 @@
 
 import React, { useState, useCallback, useMemo, useEffect } from 'react';
 import _ from 'lodash';
-import { useQuery, useSubscription, useClient } from "hasyx/lib/hasyx-client";
+import { useQuery, useSubscription, useNewHasyx } from "hasyx/lib/hasyx/hasyx-client";
 import { SidebarLayout } from "hasyx/components/sidebar/layout";
 import { SidebarData } from "hasyx/components/sidebar";
 import { Card, CardHeader, CardTitle, CardContent } from "hasyx/components/ui/card";
@@ -22,42 +22,41 @@ import { cn } from 'hasyx/lib/utils';
 function getFieldsForType(graphqlType: any, schema: any): any[] {
   if (!graphqlType?.fields) return [];
   return graphqlType.fields.map((field: any) => {
-    let currentType = field.type;
-    let isList = false;
+    // Support compact schema field format: { name, isList, returnType: { name, kind } }
+    const isCompact = field.returnType && typeof field.type === 'undefined';
+    let currentType = isCompact ? field.returnType : field.type;
+    let isList = isCompact ? !!field.isList : false;
 
-    // Unwrap NON_NULL
-    if (currentType.kind === 'NON_NULL') {
-      currentType = currentType.ofType;
-    }
-
-    // Check for LIST
-    if (currentType.kind === 'LIST') {
-      isList = true;
-      currentType = currentType.ofType; // Unwrap list
+    if (!isCompact) {
       if (currentType.kind === 'NON_NULL') {
-        currentType = currentType.ofType; // Unwrap NON_NULL inside list
+        currentType = currentType.ofType;
+      }
+      if (currentType.kind === 'LIST') {
+        isList = true;
+        currentType = currentType.ofType;
+        if (currentType.kind === 'NON_NULL') {
+          currentType = currentType.ofType;
+        }
       }
     }
 
-    const isObjectRelation = currentType.kind === 'OBJECT';
-    const isRelation = isObjectRelation;
-    const isScalar = currentType.kind === 'SCALAR';
+    const kind = currentType.kind;
+    const name = currentType.name;
+    const isRelation = kind === 'OBJECT';
+    const isScalar = kind === 'SCALAR';
 
-    const typeName = currentType.name;
     let targetTypename: string | undefined = undefined;
-
     if (isRelation) {
-        const tableMappings = schema?.hasyx?.tableMappings;
-        if (tableMappings) {
-            // Find the table mapping where the 'type' matches our GQL type name
-            const mappingKey = Object.keys(tableMappings).find(key => {
-                const mapping = tableMappings[key];
-                return mapping.type === currentType.name;
-            });
-            targetTypename = mappingKey || currentType.name; // The key is the __typename
-        } else {
-            targetTypename = currentType.name;
-        }
+      const tableMappings = schema?.hasyx?.tableMappings;
+      if (tableMappings) {
+        const mappingKey = Object.keys(tableMappings).find(key => {
+          const mapping = tableMappings[key];
+          return mapping.type === name;
+        });
+        targetTypename = mappingKey || name;
+      } else {
+        targetTypename = name;
+      }
     }
     
     return {
@@ -65,7 +64,7 @@ function getFieldsForType(graphqlType: any, schema: any): any[] {
       isRelation,
       isList,
       isScalar,
-      typeName,
+      typeName: name,
       targetTypename,
     };
   });
@@ -76,7 +75,14 @@ function getFieldDetails(schema: any, typename: string): any[] {
   const tableConfig = schema?.hasyx?.tableMappings?.[typename];
   const typeNameFromSchema = tableConfig?.type || typename;
 
-  let graphqlType = schema?.data?.__schema?.types?.find((type: any) => type.name === typeNameFromSchema);
+  // Prefer compact schema types
+  let graphqlType = schema?.hasyx?.generator?.types?.[typeNameFromSchema];
+  if (graphqlType) {
+    // Normalize to a shape with fields similar to introspection for getFieldsForType
+    graphqlType = { fields: graphqlType.fields };
+  } else {
+    graphqlType = schema?.data?.__schema?.types?.find((type: any) => type.name === typeNameFromSchema);
+  }
   
   if (!graphqlType || !graphqlType?.fields) {
     graphqlType = schema?.data?.__schema?.types?.find((type: any) => type.name === typename);
@@ -113,6 +119,7 @@ interface ConstructorState {
   table: string;
   where: Record<string, any>;
   returning: (string | NestedReturning)[];
+  role: string;
   limit?: number;
   offset?: number;
   order_by?: Array<{ [field: string]: 'asc' | 'desc' }>;
@@ -123,6 +130,9 @@ interface NestedReturning {
   [relationName: string]: {
     where?: Record<string, any>;
     returning: (string | NestedReturning)[];
+    limit?: number;
+    offset?: number;
+    order_by?: Array<{ [field: string]: 'asc' | 'desc' }>;
   };
 }
 
@@ -138,6 +148,7 @@ interface FieldInfo {
   type: string;
   isRelation: boolean;
   targetTable?: string;
+  isList?: boolean;
 }
 
 // Utility functions
@@ -185,6 +196,11 @@ function getFieldsFromTable(schema: any, tableName: string): FieldInfo[] {
   
   let graphqlType: any = null;
   for (const typeName of possibleTypeNames) {
+    const compact = schema?.hasyx?.generator?.types?.[typeName];
+    if (compact) {
+      graphqlType = { fields: compact.fields };
+      break;
+    }
     graphqlType = schema?.data?.__schema?.types?.find((type: any) => type.name === typeName);
     if (graphqlType) break;
   }
@@ -203,8 +219,8 @@ function getFieldsFromTable(schema: any, tableName: string): FieldInfo[] {
         ...commonFields,
         { name: 'name', type: 'String', isRelation: false },
         { name: 'email', type: 'String', isRelation: false },
-        { name: 'accounts', type: 'Account', isRelation: true, targetTable: 'accounts' },
-        { name: 'notifications', type: 'Notification', isRelation: true, targetTable: 'notifications' }
+        { name: 'accounts', type: 'Account', isRelation: true, targetTable: 'accounts', isList: true },
+        { name: 'notifications', type: 'Notification', isRelation: true, targetTable: 'notifications', isList: true }
       ];
     }
     
@@ -214,7 +230,7 @@ function getFieldsFromTable(schema: any, tableName: string): FieldInfo[] {
         { name: 'provider', type: 'String', isRelation: false },
         { name: 'provider_id', type: 'String', isRelation: false },
         { name: 'user_id', type: 'String', isRelation: false },
-        { name: 'user', type: 'User', isRelation: true, targetTable: 'users' }
+        { name: 'user', type: 'User', isRelation: true, targetTable: 'users', isList: false }
       ];
     }
     
@@ -224,7 +240,7 @@ function getFieldsFromTable(schema: any, tableName: string): FieldInfo[] {
         { name: 'title', type: 'String', isRelation: false },
         { name: 'message', type: 'String', isRelation: false },
         { name: 'user_id', type: 'String', isRelation: false },
-        { name: 'user', type: 'User', isRelation: true, targetTable: 'users' }
+        { name: 'user', type: 'User', isRelation: true, targetTable: 'users', isList: false }
       ];
     }
     
@@ -232,21 +248,26 @@ function getFieldsFromTable(schema: any, tableName: string): FieldInfo[] {
   }
   
   return graphqlType?.fields?.map((field: any) => {
-    const fieldType = field.type;
-    const actualType = fieldType?.ofType || fieldType; // Handle NON_NULL wrappers
-    
-    // Determine if this is a relation
-    const isRelation = actualType?.kind === 'OBJECT' || actualType?.kind === 'LIST';
-    
-    // Get the type name for display
-    let typeName = 'String'; // default
-    if (actualType?.name) {
-      typeName = actualType.name;
-    } else if (actualType?.ofType?.name) {
-      typeName = actualType.ofType.name;
+    const isCompact = field.returnType && typeof field.type === 'undefined';
+    let currentType = isCompact ? field.returnType : field.type;
+    let isList = isCompact ? !!field.isList : false;
+
+    if (!isCompact) {
+      if (currentType.kind === 'NON_NULL') {
+        currentType = currentType.ofType;
+      }
+      if (currentType.kind === 'LIST') {
+        isList = true;
+        currentType = currentType.ofType;
+        if (currentType.kind === 'NON_NULL') {
+          currentType = currentType.ofType;
+        }
+      }
     }
     
-    // Map GraphQL types to simplified types
+    const isRelation = currentType.kind === 'OBJECT';
+    let typeName = currentType?.name || 'String';
+    
     if (typeName === 'uuid') typeName = 'UUID';
     if (typeName === 'bigint') typeName = 'Int';
     if (typeName === 'timestamptz') typeName = 'DateTime';
@@ -257,7 +278,8 @@ function getFieldsFromTable(schema: any, tableName: string): FieldInfo[] {
       name: field.name,
       type: typeName,
       isRelation,
-      targetTable: isRelation ? actualType?.name : undefined
+      isList,
+      targetTable: isRelation ? (currentType.name) : undefined
     };
   });
 }
@@ -506,11 +528,14 @@ function ReturningSection({
   schema: any;
   level?: number;
 }) {
-  const addField = (fieldName: string, isRelation: boolean, targetTable?: string) => {
+  const addField = (fieldName: string, isRelation: boolean, targetTable?: string, isList?: boolean) => {
     if (isRelation && targetTable) {
+      const targetFields = getFieldsFromTable(schema, targetTable);
+      const hasIdField = targetFields.some(f => f.name === 'id' && !f.isRelation);
       const newRelation: NestedReturning = {
         [fieldName]: {
-          returning: ['id']
+          returning: hasIdField ? ['id'] : [],
+          ...(isList && { limit: 10 }),
         }
       };
       onReturningChange([...returning, newRelation]);
@@ -539,6 +564,27 @@ function ReturningSection({
     onReturningChange(newReturning);
   };
   
+  const updateNestedLimit = (index: number, relationName: string, limit: number | undefined) => {
+    const newReturning = [...returning];
+    const item = newReturning[index] as NestedReturning;
+    item[relationName].limit = limit;
+    onReturningChange(newReturning);
+  };
+
+  const updateNestedOffset = (index: number, relationName: string, offset: number | undefined) => {
+    const newReturning = [...returning];
+    const item = newReturning[index] as NestedReturning;
+    item[relationName].offset = offset;
+    onReturningChange(newReturning);
+  };
+
+  const updateNestedOrderBy = (index: number, relationName: string, orderBy: Array<{ [field: string]: 'asc' | 'desc' }> | undefined) => {
+    const newReturning = [...returning];
+    const item = newReturning[index] as NestedReturning;
+    item[relationName].order_by = orderBy;
+    onReturningChange(newReturning);
+  };
+  
   const availableFields = fields.filter(field => 
     !returning.some(r => 
       typeof r === 'string' ? r === field.name : Object.keys(r)[0] === field.name
@@ -563,7 +609,7 @@ function ReturningSection({
             <Select onValueChange={(fieldName) => {
               const field = fields.find(f => f.name === fieldName);
               if (field) {
-                addField(field.name, field.isRelation, field.targetTable);
+                addField(field.name, field.isRelation, field.targetTable, field.isList);
               }
             }}>
               <SelectTrigger className="square border-0 rounded-none hover:bg-destructive/10 hover:text-destructive flex-shrink-0 [&>svg:nth-child(2)]:hidden">
@@ -631,6 +677,22 @@ function ReturningSection({
                     onWhereChange={(newWhere) => updateNestedWhere(index, relationName, newWhere)}
                     level={level + 1}
                   />
+                  
+                  {field?.isList && (
+                    <>
+                      <LimitOffsetSection
+                        limit={relationData.limit}
+                        offset={relationData.offset}
+                        onLimitChange={(limit) => updateNestedLimit(index, relationName, limit)}
+                        onOffsetChange={(offset) => updateNestedOffset(index, relationName, offset)}
+                      />
+                      <OrderBySection
+                        fields={targetFields}
+                        orderBy={relationData.order_by}
+                        onChange={(orderBy) => updateNestedOrderBy(index, relationName, orderBy)}
+                      />
+                    </>
+                  )}
                   
                   {/* Nested Returning */}
                   <ReturningSection
@@ -769,10 +831,11 @@ function LimitOffsetSection({
             type="number"
             value={limit || ''}
             onChange={(e) => {
-              const val = e.target.value === '' ? undefined : Number(e.target.value);
+              const numValue = Number(e.target.value);
+              const val = (e.target.value === '' || numValue === 0) ? undefined : numValue;
               onLimitChange(val);
             }}
-            placeholder="100"
+            placeholder="10"
             className="h-full border-0 rounded-none text-xs bg-transparent focus:bg-transparent px-1"
             min="0"
           />
@@ -926,20 +989,38 @@ function HasyxConstructor({ value, onChange, defaultTable = 'users', schema = ha
     // Get fields for the new table
     const newTableFields = schema ? getFieldsFromTable(schema, newTable) : [];
     
-    // Auto-populate returning with all physical fields (non-relation fields)
-    // Exclude Hasyx system fields
-    const physicalFields = newTableFields
-      .filter(field => !field.isRelation && !field.name.startsWith('_hasyx_'))
-      .map(field => field.name);
+    // Auto-populate returning with fields allowed for the current role
+    const allowedColumns = schema?.hasyx?.permissions?.[newTable]?.select?.[value.role];
+    
+    let physicalFields: string[] = [];
+
+    if (Array.isArray(allowedColumns)) {
+      physicalFields = newTableFields
+        .filter(field => !field.isRelation && !field.name.startsWith('_hasyx_') && allowedColumns.includes(field.name))
+        .map(field => field.name);
+    }
+
+    if (physicalFields.length === 0) {
+      const hasIdField = newTableFields.some(field => field.name === 'id' && !field.isRelation);
+      if (hasIdField) {
+        physicalFields.push('id');
+      }
+    }
     
     onChange({
+      ...value,
       table: newTable,
       where: {},
       returning: physicalFields,
-      limit: undefined,
+      limit: 10,
       offset: undefined,
       order_by: undefined
     });
+  };
+
+  const handleRoleChange = (newRole: string) => {
+    handleTableChange(value.table);
+    onChange({ ...value, role: newRole });
   };
   
   const handleWhereChange = (newWhere: Record<string, any>) => {
@@ -978,9 +1059,26 @@ function HasyxConstructor({ value, onChange, defaultTable = 'users', schema = ha
   
   return (
     <div className="space-y-2">
-      {/* Table Selection */}
+      {/* Role and Table Selection */}
       <Card>
         <CardContent className="pt-2 pb-2">
+          <div className="w-full flex items-center border rounded h-6 bg-background mb-2">
+            <div className="px-2 py-1 text-xs font-medium bg-muted/50 flex-shrink-0">
+              Role
+            </div>
+            <div className="w-px h-4 bg-border"></div>
+            <Select value={value.role} onValueChange={handleRoleChange}>
+              <SelectTrigger className="border-0 rounded-none px-2 text-xs bg-transparent hover:bg-muted/50 flex-1 max-h-full">
+                <SelectValue placeholder="Select role" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="anonymous" className="text-xs">anonymous</SelectItem>
+                <SelectItem value="user" className="text-xs">user</SelectItem>
+                <SelectItem value="me" className="text-xs">me</SelectItem>
+                <SelectItem value="admin" className="text-xs">admin</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
           <div className="w-full flex items-center border rounded h-6 bg-background mb-2">
             <div className="px-2 py-1 text-xs font-medium bg-muted/50 flex-shrink-0">
               Table
@@ -1058,7 +1156,7 @@ function ExpTab({ constructorState }: { constructorState: ConstructorState }) {
 
 function GqlTab({ constructorState }: { constructorState: ConstructorState }) {
   const [operationType, setOperationType] = useState<'query' | 'subscription'>('query');
-  const client = useClient();
+  const client = useNewHasyx();
   
   const queryOptions = useMemo(() => {
     if (!constructorState.table) return null;
@@ -1393,14 +1491,49 @@ interface ConstructorProps {
 }
 
 export default function Constructor({ serverSession, sidebarData, schema = hasyxSchema }: ConstructorProps) {
+  const { data: session, status } = useSession();
   const [constructorState, setConstructorState] = useState<ConstructorState>({
     table: 'users',
     where: {},
     returning: [],
-    limit: undefined,
+    role: 'anonymous',
+    limit: 10,
     offset: undefined,
     order_by: undefined
   });
+  
+  const initialRoleSet = React.useRef(false);
+
+  useEffect(() => {
+    if (status !== 'loading' && !initialRoleSet.current) {
+      const newRole = session?.user ? 'user' : 'anonymous';
+      const newTable = constructorState.table || 'users';
+      
+      const newTableFields = schema ? getFieldsFromTable(schema, newTable) : [];
+      const allowedColumns = schema?.hasyx?.permissions?.[newTable]?.select?.[newRole];
+      let physicalFields: string[] = [];
+
+      if (Array.isArray(allowedColumns)) {
+        physicalFields = newTableFields
+          .filter(field => !field.isRelation && !field.name.startsWith('_hasyx_') && allowedColumns.includes(field.name))
+          .map(field => field.name);
+      }
+
+      if (physicalFields.length === 0) {
+        const hasIdField = newTableFields.some(field => field.name === 'id' && !field.isRelation);
+        if (hasIdField) {
+          physicalFields.push('id');
+        }
+      }
+
+      setConstructorState(s => ({ 
+        ...s, 
+        role: newRole,
+        returning: physicalFields
+      }));
+      initialRoleSet.current = true;
+    }
+  }, [status, session, schema, constructorState.table]);
   
   return (
     <SidebarLayout sidebarData={sidebarData} breadcrumb={[
@@ -1411,7 +1544,7 @@ export default function Constructor({ serverSession, sidebarData, schema = hasyx
         value={constructorState}
         onChange={setConstructorState}
         defaultTable="users"
-        schema={hasyxSchema}
+        schema={schema}
       />
     </SidebarLayout>
   );

@@ -16,9 +16,9 @@ The integration provides:
 ## 🏗️ Architecture
 
 ### Components:
-1. **GitHub Actions Workflow** (`.github/workflows/telegram-notifications.yml`)
-   - Waits for target workflows to complete
-   - Triggers notification script
+1. **GitHub Actions Workflow** (`.github/workflows/workflow.yml`)
+   - Unified workflow that handles all CI/CD tasks
+   - Automatically triggers Telegram notifications after completion
 
 2. **Notification Script** (`lib/github-telegram-bot.ts`)
    - Fetches commit and workflow data from GitHub API
@@ -33,7 +33,7 @@ The integration provides:
 
 ### 1. Enable in Your Project
 
-When you run `npx hasyx init`, the GitHub Actions workflow is automatically created in your project.
+When you run `npx hasyx init`, the unified GitHub Actions workflow is automatically created in your project.
 
 ### 2. Configure Environment Variables
 
@@ -42,13 +42,12 @@ Set these variables in your `.env` file and GitHub repository secrets:
 #### Required:
 ```bash
 TELEGRAM_BOT_TOKEN=your_bot_token_here
+TELEGRAM_CHANNEL_ID=your_channel_id_here
 OPENROUTER_API_KEY=your_openrouter_api_key
 ```
 
 #### Optional:
 ```bash
-TELEGRAM_ADMIN_CHAT_ID=your_admin_chat_id_here
-TELEGRAM_CHANNEL_ID=your_channel_id_here
 GITHUB_TELEGRAM_BOT=1  # 1=enabled, 2=test mode, unset=disabled
 ```
 
@@ -57,17 +56,16 @@ GITHUB_TELEGRAM_BOT=1  # 1=enabled, 2=test mode, unset=disabled
 Configure these secrets in your GitHub repository settings:
 
 - `TELEGRAM_BOT_TOKEN` - Your Telegram bot API token
+- `TELEGRAM_CHANNEL_ID` - Channel ID for GitHub commit notifications
 - `OPENROUTER_API_KEY` - OpenRouter API key for AI message generation
-- `TELEGRAM_ADMIN_CHAT_ID` - (Optional) Admin chat ID for notifications
-- `TELEGRAM_CHANNEL_ID` - (Optional) Channel ID for announcements
 - `GITHUB_TELEGRAM_BOT` - (Optional) Control mode: `1` or `2`
 
 ### 4. Telegram Bot Setup
 
 1. Create a bot via @BotFather on Telegram
 2. Get the bot token
-3. Add the bot to your group/channel if using those targets
-4. Users can start the bot with `/start` to receive notifications
+3. Add the bot to your channel as an administrator
+4. Get the channel ID (e.g., `@your_channel` or `-1001234567890`)
 
 ## 📋 Configuration Options
 
@@ -77,18 +75,22 @@ Configure these secrets in your GitHub repository settings:
 - **Unset** - Disabled: no notifications sent
 
 ### Target Workflows:
-The system waits for these workflows to complete:
+The unified workflow automatically handles all CI/CD tasks in sequence:
 - `test` - Test suite
 - `npm-publish` - NPM package publication
-- `Deploy Next.js site to Pages` - GitHub Pages deployment
+- `deploy-nextjs` - GitHub Pages deployment
+- `docker-build` - Docker image building and publishing
+- `android-build` - Android APK building
+- `create-release` - GitHub Release creation with APK attachment
+- `telegram-notification` - Telegram notifications
 
-You can modify the target workflows in the `.github/workflows/telegram-notifications.yml` file.
+All tasks are handled by the single `.github/workflows/workflow.yml` file.
 
 ## 🔄 How It Works
 
 ### Workflow Sequence:
 1. **Trigger**: Push to main branch
-2. **Wait**: Monitor target workflows until completion (max 30 minutes)
+2. **Execute**: All CI/CD tasks run sequentially in the unified workflow
 3. **Collect**: Gather commit info, workflow results, file changes
 4. **Generate**: Create AI-powered message with full context
 5. **Send**: Notify all registered Telegram bot users
@@ -149,19 +151,8 @@ Edit the AI prompt in `lib/github-telegram-bot.ts` to customize:
 - Information emphasis
 - Tone and style
 
-### Workflow Timing:
-Modify timeout and check intervals in the workflow file:
-```yaml
-# Wait up to 30 minutes (1800 seconds)
-const maxWaitTime = 1800;
-const checkInterval = 30;
-```
-
-### Target Workflows:
-Update the target workflow list:
-```yaml
-const targetWorkflows = ['test', 'npm-publish', 'Deploy Next.js site to Pages'];
-```
+### Workflow Configuration:
+The unified workflow automatically handles all timing and sequencing. No need to modify individual workflow configurations.
 
 ## 🔍 Troubleshooting
 
@@ -169,34 +160,35 @@ const targetWorkflows = ['test', 'npm-publish', 'Deploy Next.js site to Pages'];
 
 **No notifications sent:**
 - Check `GITHUB_TELEGRAM_BOT` is set to `1`
-- Verify all required secrets are configured
+- Verify `TELEGRAM_CHANNEL_ID` is configured correctly
+- Ensure bot has administrator permissions in the channel
 - Check GitHub Actions logs for errors
 
 **API rate limits:**
 - The script includes rate limiting protection
 - Failed requests are logged for debugging
 
-**Workflow timeout:**
-- Increase `maxWaitTime` if your workflows take longer
-- Check that target workflow names match exactly
+**Workflow issues:**
+- Check GitHub Actions logs for the unified workflow
+- Verify all required secrets are configured
 
 **Bot permissions:**
-- Ensure bot has permission to send messages
-- For channels, bot must be added as administrator
+- Bot must be added to the channel as administrator
+- Ensure bot has permission to send messages in the channel
 
 ## 🔗 Related Documentation
 
 - [GitHub Actions Documentation](https://docs.github.com/en/actions)
 - [Telegram Bot API](https://core.telegram.org/bots/api)
 - [OpenRouter API](https://openrouter.ai/docs)
-- [Hasyx Assistant](./lib/assist-telegram.ts) - Setup automation
+ 
 
 ## 🤝 Contributing
 
 The integration is part of the Hasyx framework. To contribute:
 1. Fork the repository
 2. Make your changes
-3. Test with `GITHUB_TELEGRAM_BOT=2`
+3. Test with `HASYX_GITHUB_TELEGRAM_BOT=2`
 4. Submit a pull request
 
 For issues or feature requests, please use the GitHub issue tracker. 

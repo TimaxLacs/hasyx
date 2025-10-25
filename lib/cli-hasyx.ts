@@ -3,33 +3,501 @@ import fs from 'fs-extra';
 import path from 'path';
 import spawn from 'cross-spawn';
 import Debug from './debug';
-import { createDefaultEventTriggers, syncEventTriggersFromDirectory } from './events';
-import { buildDocumentation } from './doc-public';
-import * as assist from './assist';
+import { createDefaultEventTriggers, syncEventTriggersFromDirectory, syncAllTriggersFromDirectory } from './events';
 import { printMarkdown } from './markdown-terminal';
 import dotenv from 'dotenv';
 import { buildClient } from './build-client';
 import { migrate } from './migrate';
 import { unmigrate } from './unmigrate';
 import { generateHasuraSchema } from './hasura-schema';
-import { runJsEnvironment } from './js';
-import { ask } from './ask';
-import { runTsxEnvironment } from './tsx';
+// import moved to dynamic inside jsCommand to avoid loading heavy client code during unrelated commands
+// Minimal .env parser (local replacement for assist-common)
+function parseEnvFile(filePath: string): Record<string, string> {
+  const fs = require('fs');
+  const env: Record<string, string> = {};
+  try {
+    const content = fs.readFileSync(filePath, 'utf-8');
+    for (const line of content.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const idx = trimmed.indexOf('=');
+      if (idx <= 0) continue;
+      const key = trimmed.substring(0, idx).trim();
+      const value = trimmed.substring(idx + 1).trim();
+      env[key] = value;
+    }
+  } catch {}
+  return env;
+}
+
+/**
+ * Получает имя проекта из git окружения
+ * Если git репозиторий не найден, возвращает 'super-idea'
+ */
+function getProjectNameFromGit(): string {
+  try {
+    // Проверяем, есть ли .git папка в текущей директории
+    if (!fs.existsSync('.git')) {
+      return 'super-idea';
+    }
+
+    // Получаем remote origin URL
+    const remoteUrl = spawn.sync('git', ['config', '--get', 'remote.origin.url'], { 
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe']
+    }).stdout?.trim();
+
+    if (!remoteUrl) {
+      return 'super-idea';
+    }
+
+    // Извлекаем имя репозитория из URL
+    // Поддерживаем форматы:
+    // https://github.com/username/repo-name.git
+    // git@github.com:username/repo-name.git
+    // ssh://git@github.com/username/repo-name.git
+    
+    let repoName = '';
+    
+    if (remoteUrl.includes('github.com') || remoteUrl.includes('gitlab.com') || remoteUrl.includes('bitbucket.org')) {
+      // HTTPS/SSH формат для популярных платформ
+      const parts = remoteUrl.split('/');
+      repoName = parts[parts.length - 1];
+    } else if (remoteUrl.includes('git@')) {
+      // SSH формат
+      const parts = remoteUrl.split(':');
+      if (parts.length > 1) {
+        const lastPart = parts[parts.length - 1];
+        repoName = lastPart.split('/').pop() || '';
+      }
+    } else if (remoteUrl.includes('ssh://')) {
+      // SSH URL формат
+      const parts = remoteUrl.split('/');
+      repoName = parts[parts.length - 1];
+    }
+
+    // Убираем .git расширение если есть
+    if (repoName.endsWith('.git')) {
+      repoName = repoName.slice(0, -4);
+    }
+
+    return repoName || 'super-idea';
+  } catch (error) {
+    // В случае любой ошибки возвращаем fallback
+    return 'super-idea';
+  }
+}
+
+import * as gh from './github';
+import * as vercelApi from './vercel/index';
+import { setWebhook as tgSetWebhook, removeWebhook as tgRemoveWebhook, calibrate as tgCalibrate } from './telegram';
+// ask command will be registered with lazy import to avoid resolving 'hasyx/*' in child projects during other commands
+// import moved to dynamic inside tsxCommand to avoid loading heavy client code during unrelated commands
 import { assetsCommand } from './assets';
 import { eventsCommand } from './events-cli';
 import { unbuildCommand } from './unbuild';
-import { runTelegramSetupAndCalibration } from './assist';
+// assist removed
 import { localCommand } from './local';
 import { vercelCommand } from './vercel';
-import { CloudFlare, CloudflareConfig, DnsRecord } from './cloudflare';
+import { CloudFlare, CloudflareConfig, DnsRecord } from './cloudflare/cloudflare';
 import { SSL } from './ssl';
-import { Nginx } from './nginx';
-import { configureDocker, listContainers, defineContainer, undefineContainer, showContainerLogs, showContainerEnv } from './assist-docker';
+import { Nginx } from './nginx/nginx';
+import { listContainers, defineContainer, undefineContainer, showContainerLogs, showContainerEnv } from './docker';
+import { processLogs } from './logs/logs';
+import { processConfiguredDiffs } from './logs/logs-diffs';
+import { processConfiguredStates } from './logs/logs-states';
+import { envCommand } from './env';
+import { 
+  generateProjectJsonSchemas, syncSchemasToDatabase,
+  processConfiguredValidationDefine, processConfiguredValidationUndefine,
+  processFullValidationSync
+} from './validation';
 
-export {
-  assetsCommand, eventsCommand, unbuildCommand, assist, localCommand, vercelCommand };
+export { 
+  assetsCommand, eventsCommand, unbuildCommand, localCommand, vercelCommand, processLogs, processConfiguredDiffs, processConfiguredStates, envCommand };
 
-dotenv.config({ path: path.join(process.cwd(), '.env') });
+// Exported lists used by build-templates.ts to stage raw TS/TSX for publishing
+export const LIB_SCAFFOLD_FILES: string[] = [
+  'lib/entities.tsx',
+  'lib/ask.ts',
+  'lib/debug.ts',
+  'lib/cli.ts',
+  'lib/ssr.tsx',
+  'lib/ssr-client.tsx',
+  'lib/ssr-server.tsx',
+  'lib/github-telegram-bot.ts',
+  'lib/config.tsx',
+  'lib/config/env.tsx',
+  'lib/config/docker-compose.tsx',
+  'lib/url.ts',
+  'lib/i18n/config.ts',
+  'lib/i18n/messages.ts',
+  'lib/app-client-layout.tsx',
+];
+
+export const COMPONENTS_SCAFFOLD_FILES: string[] = [
+  'components/sidebar/layout.tsx',
+  'components/entities/default.tsx',
+];
+
+// Config command: runs the interactive or silent configuration tool
+export const configCommand = async (options: { silent?: boolean } = {}) => {
+  debug('Executing "config" command.', options);
+  const cwd = process.cwd();
+  const args = ['tsx', 'lib/config.tsx'];
+  if (options.silent) args.push('--silent');
+
+  const result = spawn.sync('npx', args, {
+    stdio: 'inherit',
+    cwd,
+  });
+
+  if (result.error) {
+    console.error('❌ Config command failed to start:', result.error);
+    process.exit(1);
+  }
+  if (result.status !== 0) {
+    console.error(`❌ Config command exited with status ${result.status}`);
+    process.exit(result.status ?? 1);
+  }
+};
+
+// Gitpod command: automatically configure Hasyx for Gitpod environment
+export const gitpodCommand = async () => {
+  debug('Executing "gitpod" command');
+  
+  // Check if running in Gitpod environment
+  if (!process.env.GITPOD_WORKSPACE_ID) {
+    console.error('❌ This command must be run in Gitpod environment');
+    console.error('💡 Gitpod environment variables not detected');
+    process.exit(1);
+  }
+
+  console.log('🚀 Setting up Hasyx for Gitpod environment...');
+  
+  try {
+    // Get Gitpod-specific configuration
+    const gitpodConfig = await generateGitpodConfig();
+    
+    // Update or create hasyx.config.json
+    await updateHasyxConfig(gitpodConfig);
+    
+    // Generate .env and docker-compose.yml using existing functions
+    console.log('📝 Generating .env and docker-compose.yml...');
+    await generateEnvAndDockerCompose();
+    
+    console.log('✅ Gitpod configuration completed successfully!');
+    console.log('🚀 Next steps:');
+    console.log('   1. Run "docker compose up -d" to start infrastructure services (PostgreSQL, Hasura, MinIO)');
+    console.log('   2. Run "npm run migrate" to apply database migrations');
+    console.log('   3. Run "npm run dev" to start development server (runs locally, not in Docker)');
+    console.log('');
+    console.log('💡 Note: In Gitpod, the app runs locally via "npm run dev", not in Docker container');
+    console.log('   Docker is used only for infrastructure services (database, GraphQL, storage)');
+    
+  } catch (error) {
+    console.error('❌ Gitpod setup failed:', error);
+    debug('Gitpod command error:', error);
+    process.exit(1);
+  }
+};
+
+// Generate Gitpod-specific configuration
+async function generateGitpodConfig() {
+  const workspaceId = process.env.GITPOD_WORKSPACE_ID;
+  const workspaceUrl = process.env.GITPOD_WORKSPACE_URL || 'gitpod.io';
+  
+  // Generate secure random secrets
+  const crypto = await import('crypto');
+  const generateSecret = (length: number = 32) => crypto.randomBytes(length).toString('hex');
+  
+  return {
+    variant: 'gitpod',
+    variants: {
+      gitpod: {
+        hasura: 'gitpod',
+        pg: 'gitpod',
+        storage: 'gitpod',
+        nextAuthSecrets: 'gitpod'
+      }
+    },
+    hasura: {
+      gitpod: {
+        url: 'http://localhost:8080/v1/graphql',
+        secret: generateSecret(32),
+        jwtSecret: JSON.stringify({
+          type: 'HS256',
+          key: generateSecret(32)
+        }),
+        eventSecret: generateSecret(32)
+      }
+    },
+    pg: {
+      gitpod: {
+        url: 'postgres://postgres:postgrespassword@localhost:5432/hasyx?sslmode=disable'
+      }
+    },
+    storage: {
+      gitpod: {
+        provider: 'minio',
+        bucket: 'hasyx',
+        region: 'us-east-1',
+        useLocal: true,
+        endpoint: 'http://localhost:9000',
+        accessKeyId: 'minioadmin',
+        secretAccessKey: 'minioadmin',
+        forcePathStyle: true,
+        useAntivirus: false,
+        useImageManipulation: false
+      }
+    },
+    nextAuthSecrets: {
+      gitpod: {
+        secret: generateSecret(32),
+        url: `https://3000-${workspaceId}.ws-${workspaceUrl}`
+      }
+    }
+  };
+}
+
+// Update or create hasyx.config.json
+async function updateHasyxConfig(gitpodConfig: any) {
+  const fs = await import('fs-extra');
+  const path = await import('path');
+  
+  const configPath = path.join(process.cwd(), 'hasyx.config.json');
+  let currentConfig: any = {};
+  
+  try {
+    if (fs.existsSync(configPath)) {
+      const content = fs.readFileSync(configPath, 'utf8');
+      currentConfig = JSON.parse(content);
+      console.log('📖 Found existing hasyx.config.json, updating...');
+    } else {
+      console.log('📝 Creating new hasyx.config.json...');
+    }
+  } catch (error) {
+    console.warn('⚠️ Could not read existing config, creating new one');
+    debug('Error reading existing config:', error);
+  }
+  
+  // Merge Gitpod configuration with existing config
+  const updatedConfig = {
+    ...currentConfig,
+    ...gitpodConfig,
+    // Ensure variants object is properly merged
+    variants: {
+      ...currentConfig.variants,
+      ...gitpodConfig.variants
+    },
+    // Ensure other objects are properly merged
+    hasura: {
+      ...currentConfig.hasura,
+      ...gitpodConfig.hasura
+    },
+    pg: {
+      ...currentConfig.pg,
+      ...gitpodConfig.pg
+    },
+    storage: {
+      ...currentConfig.storage,
+      ...gitpodConfig.storage
+    },
+    nextAuthSecrets: {
+      ...currentConfig.nextAuthSecrets,
+      ...gitpodConfig.nextAuthSecrets
+    }
+  };
+  
+  // Write updated configuration
+  await fs.writeJson(configPath, updatedConfig, { spaces: 2 });
+  console.log('✅ hasyx.config.json updated successfully');
+}
+
+// Generate .env and docker-compose.yml using existing functions
+async function generateEnvAndDockerCompose() {
+  try {
+    // Import and call generateEnv
+    const { generateEnv } = await import('./config/env');
+    await generateEnv();
+    console.log('✅ .env file generated');
+  } catch (error) {
+    console.error('❌ Failed to generate .env:', error);
+    throw error;
+  }
+  
+  try {
+    // Import and call generateDockerCompose
+    const { generateDockerCompose } = await import('./config/docker-compose');
+    await generateDockerCompose();
+    console.log('✅ docker-compose.yml generated');
+  } catch (error) {
+    console.error('❌ Failed to generate docker-compose.yml:', error);
+    throw error;
+  }
+}
+
+/**
+ * GitHub sync command: purge all repo secrets and sync from .env
+ */
+export const githubSyncCommand = async () => {
+  const remoteUrl = gh.getRemoteUrl();
+  if (!remoteUrl) {
+    console.error('❌ Git remote origin not found. Initialize a GitHub repo first.');
+    process.exit(1);
+  }
+  gh.ensureGhCli();
+  try { gh.checkAuth(); } catch (e) { console.error('❌ GitHub CLI not authenticated. Run: gh auth login'); process.exit(1); }
+
+  // List and remove all existing secrets
+  const list = spawn.sync('gh', ['secret', 'list', '-R', remoteUrl], { encoding: 'utf-8' });
+  const lines = (list.stdout || '').split('\n').map(l => l.trim()).filter(Boolean);
+  for (const line of lines) {
+    const name = line.split(/\s+/)[0];
+    if (!name) continue;
+    spawn.sync('gh', ['secret', 'remove', name, '-R', remoteUrl], { encoding: 'utf-8' });
+  }
+
+  // Add from .env
+  const env = parseEnvFile('.env');
+  for (const [key, value] of Object.entries(env)) {
+    if (key.startsWith('GITHUB_')) continue; // reserved
+    if (typeof value !== 'string') continue;
+    try { gh.setSecret(remoteUrl, key, value); console.log(`✅ Set ${key}`); } catch { console.warn(`⚠️ Failed to set ${key}`); }
+  }
+  console.log('✅ GitHub secrets synchronized from .env');
+};
+
+/**
+ * GitHub clear command: remove all repo secrets (no re-add)
+ */
+export const githubClearCommand = async () => {
+  const remoteUrl = gh.getRemoteUrl();
+  if (!remoteUrl) {
+    console.error('❌ Git remote origin not found. Initialize a GitHub repo first.');
+    process.exit(1);
+  }
+  gh.ensureGhCli();
+  try { gh.checkAuth(); } catch (e) { console.error('❌ GitHub CLI not authenticated. Run: gh auth login'); process.exit(1); }
+
+  // List and remove all existing secrets
+  const list = spawn.sync('gh', ['secret', 'list', '-R', remoteUrl], { encoding: 'utf-8' });
+  const lines = (list.stdout || '').split('\n').map(l => l.trim()).filter(Boolean);
+  for (const line of lines) {
+    const name = line.split(/\s+/)[0];
+    if (!name) continue;
+    spawn.sync('gh', ['secret', 'remove', name, '-R', remoteUrl], { encoding: 'utf-8' });
+  }
+
+  console.log('✅ GitHub secrets cleared');
+};
+
+/**
+ * Describe GitHub commands
+ */
+export const githubCommandDescribe = (cmd: Command) => {
+  const c = cmd.description('GitHub operations')
+    .addHelpText('after', `\nExamples:\n  npx hasyx github sync\n  npx hasyx github clear\n  npm run cli -- github --help`);
+  c.command('sync').description('Purge and sync GitHub Actions secrets from .env').action(githubSyncCommand);
+  c.command('clear').description('Remove all GitHub Actions secrets (no re-add)').action(githubClearCommand);
+  return c;
+};
+
+/**
+ * Vercel sync command: purge Vercel envs and sync from .env for all environments
+ */
+export const vercelSyncCommand = async () => {
+  const env = parseEnvFile('.env');
+  const token = env.VERCEL_TOKEN;
+  const project = env.VERCEL_PROJECT_NAME;
+  const teamId = env.VERCEL_TEAM_ID;
+  const userId = env.VERCEL_USER_ID;
+  if (!token || !project) {
+    console.error('❌ Missing VERCEL_TOKEN or VERCEL_PROJECT_NAME in .env');
+    process.exit(1);
+  }
+  // Ensure linked
+  if (!vercelApi.link(project, token, teamId, userId)) {
+    console.error(`❌ Failed to link to Vercel project ${project}`);
+    process.exit(1);
+  }
+  // Pull current to know keys
+  if (!vercelApi.envPull(token, '.env.vercel')) {
+    console.warn('⚠️ Could not pull current Vercel env; proceeding with sync');
+  }
+  const current = parseEnvFile('.env.vercel');
+  // Print a clear plan so the Vercel CLI "Changes:" (pull step) is not confusing
+  const currentKeys = Object.keys(current).filter(k => k);
+  const envKeysToPush = Object.keys(env).filter(k => !['VERCEL_TOKEN','VERCEL_TEAM_ID','VERCEL_USER_ID','VERCEL_PROJECT_NAME'].includes(k));
+  console.log(`ℹ️ Plan: will remove ${currentKeys.length} keys from development/preview/production and add ${envKeysToPush.length} keys from .env`);
+  const envTypes: Array<'production'|'preview'|'development'> = ['production', 'preview', 'development'];
+  // Remove all currently present keys
+  for (const key of Object.keys(current)) {
+    for (const t of envTypes) { vercelApi.envRemove(key, t, token); }
+  }
+  // Add all from .env excluding Vercel control keys
+  for (const [key, value] of Object.entries(env)) {
+    if (['VERCEL_TOKEN','VERCEL_TEAM_ID','VERCEL_USER_ID','VERCEL_PROJECT_NAME'].includes(key)) continue;
+    if (typeof value !== 'string') continue;
+    // Force WS off for Vercel runtime
+    if (key === 'NEXT_PUBLIC_WS') {
+      for (const t of envTypes) { vercelApi.envAdd(key, t, '0', token); }
+      continue;
+    }
+    for (const t of envTypes) { vercelApi.envAdd(key, t, value, token); }
+  }
+  // Verify by pulling again and reporting concise summary
+  if (vercelApi.envPull(token, '.env.vercel')) {
+    const after = parseEnvFile('.env.vercel');
+    console.log(`✅ Vercel environment synchronized: ${Object.keys(after).length} keys present (development) from .env`);
+    console.log('ℹ️ Note: the "Changes:" list above refers only to the initial pull step, not the final state');
+  } else {
+    console.log('✅ Vercel environment variables synchronized from .env');
+  }
+};
+
+/**
+ * Vercel clear command: remove all env vars in production/preview/development (no re-add)
+ */
+export const vercelClearCommand = async () => {
+  const env = parseEnvFile('.env');
+  const token = env.VERCEL_TOKEN;
+  const project = env.VERCEL_PROJECT_NAME;
+  const teamId = env.VERCEL_TEAM_ID;
+  const userId = env.VERCEL_USER_ID;
+  if (!token || !project) {
+    console.error('❌ Missing VERCEL_TOKEN or VERCEL_PROJECT_NAME in .env');
+    process.exit(1);
+  }
+  // Ensure linked
+  if (!vercelApi.link(project, token, teamId, userId)) {
+    console.error(`❌ Failed to link to Vercel project ${project}`);
+    process.exit(1);
+  }
+  // Pull current to know keys
+  if (!vercelApi.envPull(token, '.env.vercel')) {
+    console.warn('⚠️ Could not pull current Vercel env; proceeding with clear');
+  }
+  const current = parseEnvFile('.env.vercel');
+  const envTypes: Array<'production'|'preview'|'development'> = ['production', 'preview', 'development'];
+  // Remove all currently present keys
+  for (const key of Object.keys(current)) {
+    for (const t of envTypes) { vercelApi.envRemove(key, t, token); }
+  }
+  console.log('✅ Vercel environment variables cleared');
+};
+
+// (moved into existing describe functions below)
+
+// Load .env file from current working directory
+const envResult = dotenv.config({ path: path.join(process.cwd(), '.env') });
+
+if (envResult.error) {
+  // Only log in debug mode to avoid cluttering output for users without .env files
+  console.debug('Failed to load .env file:', envResult.error);
+} else {
+  console.debug('.env file loaded successfully');
+}
 
 // Create a debugger instance for the CLI
 const debug = Debug('cli');
@@ -49,6 +517,17 @@ export const getTemplateContent = (fileName: string, templatesDir?: string): str
     throw new Error(`Template file not found: ${fileName}`);
   }
 };
+
+// Helper: recursively copy directory with optional overwrite
+async function copyDirectoryRecursive(sourceDir: string, targetDir: string, options: { overwrite: boolean }) {
+  debug(`copyDirectoryRecursive source=${sourceDir} target=${targetDir} overwrite=${options.overwrite}`);
+  if (!fs.existsSync(sourceDir)) {
+    console.warn(`⚠️ Source directory not found: ${sourceDir}`);
+    return;
+  }
+  await fs.ensureDir(targetDir);
+  await fs.copy(sourceDir, targetDir, { overwrite: options.overwrite, errorOnExist: false });
+}
 
 // Helper function to ensure WebSocket support in the project
 export const ensureWebSocketSupport = (projectRoot: string): void => {
@@ -170,6 +649,72 @@ export const ensureWebSocketSupport = (projectRoot: string): void => {
   }
 };
 
+// Generate Docker-specific configuration (similar to generateGitpodConfig)
+async function generateDockerConfig() {
+  // Generate secure random secrets
+  const crypto = await import('crypto');
+  const generateSecret = (length: number = 32) => crypto.randomBytes(length).toString('hex');
+  
+  return {
+    variant: 'docker',
+    variants: {
+      docker: {
+        host: 'docker',
+        hasura: 'docker',
+        pg: 'docker',
+        storage: 'docker',
+        nextAuthSecrets: 'docker'
+      }
+    },
+    hosts: {
+      docker: {
+        port: 3000,
+        url: 'http://localhost:3000',
+        clientOnly: false,
+        jwtAuth: false,
+        jwtForce: false,
+        watchtower: true
+      }
+    },
+    hasura: {
+      docker: {
+        url: 'http://localhost:8080/v1/graphql',
+        secret: generateSecret(32),
+        jwtSecret: JSON.stringify({
+          type: 'HS256',
+          key: generateSecret(32)
+        }),
+        eventSecret: generateSecret(32)
+      }
+    },
+    pg: {
+      docker: {
+        url: 'postgres://postgres:postgrespassword@postgres:5432/hasyx?sslmode=disable'
+      }
+    },
+    storage: {
+      docker: {
+        provider: 'minio',
+        bucket: 'hasyx',
+        region: 'us-east-1',
+        useLocal: true,
+        endpoint: 'http://hasyx-minio:9000',
+        accessKeyId: 'minioadmin',
+        secretAccessKey: 'minioadmin',
+        forcePathStyle: true,
+        useAntivirus: false,
+        useImageManipulation: false
+      }
+    },
+    nextAuthSecrets: {
+      docker: {
+        secret: generateSecret(32),
+        url: 'http://localhost:3000'
+      }
+    }
+  };
+}
+
 // Command implementations
 export const initCommand = async (options: any, packageName: string = 'hasyx') => {
   debug('Executing "init" command.');
@@ -184,24 +729,64 @@ export const initCommand = async (options: any, packageName: string = 'hasyx') =
   const targetDir = projectRoot;
   debug(`Target directory for init: ${targetDir}`);
 
-  // Get project name from package.json
+  // Get project name from package.json or git repository
   let projectName = packageName; // Default fallback
+  let pkgJson: any = {};
+  const pkgJsonPath = path.join(projectRoot, 'package.json');
+  let packageJsonExists = false;
+  
   try {
-    const pkgJsonPath = path.join(projectRoot, 'package.json');
-    const pkgJson = await fs.readJson(pkgJsonPath);
-    if (pkgJson.name) {
-      projectName = pkgJson.name;
-      debug(`Found project name in package.json: ${projectName}`);
+    if (fs.existsSync(pkgJsonPath)) {
+      pkgJson = await fs.readJson(pkgJsonPath);
+      packageJsonExists = true;
+      
+      if (pkgJson.name) {
+        projectName = pkgJson.name;
+        debug(`Found project name in package.json: ${projectName}`);
+      } else {
+        // Если имя не задано, получаем из git
+        const gitProjectName = getProjectNameFromGit();
+        projectName = gitProjectName;
+        pkgJson.name = gitProjectName;
+        debug(`No project name found in package.json, using git repository name: ${projectName}`);
+      }
     } else {
-      debug(`No project name found in package.json, using default: ${packageName}`);
+      // Если package.json не существует, создаем базовый
+      const gitProjectName = getProjectNameFromGit();
+      projectName = gitProjectName;
+      pkgJson = {
+        name: gitProjectName,
+        version: '0.0.0',
+        description: `A brilliant ${gitProjectName} project - turning ideas into reality`,
+        private: true,
+        scripts: {},
+        dependencies: {},
+        devDependencies: {}
+      };
+      debug(`Created new package.json with project name: ${projectName}`);
     }
   } catch (error) {
-    console.warn(`⚠️ Could not read package.json to determine project name, using default: ${packageName}`);
+    console.warn(`⚠️ Could not read package.json to determine project name, using git repository name`);
     debug(`Error reading package.json: ${error}`);
+    
+    const gitProjectName = getProjectNameFromGit();
+    projectName = gitProjectName;
+    pkgJson = {
+      name: gitProjectName,
+      version: '0.0.0',
+      description: `A brilliant ${gitProjectName} project - turning ideas into reality`,
+      private: true,
+      scripts: {},
+      dependencies: {},
+      devDependencies: {}
+    };
   }
 
   // Prevent hasyx from initializing itself
-  if (projectName === packageName) {
+  // Only block if we're actually in a hasyx project directory (has package.json with hasyx name)
+  const hasPackageJson = fs.existsSync(pkgJsonPath);
+  
+  if (projectName === packageName && hasPackageJson) {
     console.warn(
       `❌ Error: Running \`${packageName} init\` within the \`${packageName}\` project itself is not allowed.\n` +
       'This command is intended to initialize hasyx in other projects.\n' +
@@ -211,102 +796,49 @@ export const initCommand = async (options: any, packageName: string = 'hasyx') =
     process.exit(1);
   }
 
-  // Files to create or replace (always overwrite)
+  // Files to create or replace (always overwrite) — keep only non-app items, app copied as a whole below
   const filesToCreateOrReplace = {
-    '.github/workflows/npm-publish.yml': '.github/workflows/npm-publish.yml',
-    '.github/workflows/test.yml': '.github/workflows/test.yml',
-    '.github/workflows/nextjs.yml': '.github/workflows/nextjs.yml',
-    '.github/workflows/telegram-notifications.yml': '.github/workflows/telegram-notifications.yml',
-    '.github/workflows/docker-publish.yml': '.github/workflows/docker-publish.yml',
-    'app/api/auth/[...nextauth]/route.ts': 'app/api/auth/[...nextauth]/route.ts',
-    'app/options.ts': 'app/options.ts',
-    'app/api/auth/verify/route.ts': 'app/api/auth/verify/route.ts',
-    'app/api/auth/route.ts': 'app/api/auth/route.ts',
-    'app/api/graphql/route.ts': 'app/api/graphql/route.ts',
-    'app/api/events/[name]/route.ts': 'app/api/events/[name]/route.ts',
-    'app/api/telegram_bot/route.ts': 'app/api/telegram_bot/route.ts',
-    'app/api/health/route.ts': 'app/api/health/route.ts',
-  };
+            '.github/workflows/workflow.yml': '.github/workflows/workflow.yml',
+  } as Record<string, string>;
 
   // Files to create if not exists (or force replace if --reinit)
-  const filesToCreateIfNotExists = {
-    'app/sidebar.ts': 'app/sidebar.ts',
-    'app/layout.tsx': 'app/layout.tsx',
-    'app/page.tsx': 'app/page.tsx',
-    'app/globals.css': 'app/globals.css',
-    'app/hasyx/diagnostics/page.tsx': 'app/hasyx/diagnostics/page.tsx',
-    'app/hasyx/aframe/page.tsx': 'app/hasyx/aframe/page.tsx',
-    'app/hasyx/aframe/client.tsx': 'app/hasyx/aframe/client.tsx',
-    'app/hasyx/payments/page.tsx': 'app/hasyx/payments/page.tsx',
-    'app/hasyx/cyto/page.tsx': 'app/hasyx/cyto/page.tsx',
-    'app/hasyx/cyto/client.tsx': 'app/hasyx/cyto/client.tsx',
-    'app/hasyx/pwa/page.tsx': 'app/hasyx/pwa/page.tsx',
-    'app/hasyx/pwa/client.tsx': 'app/hasyx/pwa/client.tsx',
-    'app/hasyx/constructor/page.tsx': 'app/hasyx/constructor/page.tsx',
-    'app/hasyx/doc/page.tsx': 'app/hasyx/doc/page.tsx',
-    'app/hasyx/doc/[filename]/page.tsx': 'app/hasyx/doc/[filename]/page.tsx',
-    'components/sidebar/layout.tsx': 'components/sidebar/layout.tsx',
-    'components/entities/default.tsx': 'components/entities/default.tsx',
-    'lib/entities.tsx': 'lib/entities.template',
-    'lib/ask.ts': 'lib/ask.template',
+  const filesToCreateIfNotExists: Record<string, string> = {
+    // Non-app files that we still want to seed when missing
+    'schema.tsx': 'schema.tsx',
     'public/favicon.ico': 'public/favicon.ico',
     'public/logo.svg': 'public/logo.svg',
-    '.gitignore': '.gitignore.template',
-    '.npmignore': '.npmignore.template',
-    '.npmrc': '.npmrc.template',
+    'public/hasura-schema.json': 'public/hasura-schema.json',
+    'Dockerfile': 'Dockerfile',
+    'Dockerfile.postgres': 'Dockerfile.postgres',
+    '.dockerignore': '.dockerignore',
     'vercel.json': 'vercel.json',
     'babel.jest.config.mjs': 'babel.jest.config.mjs',
     'jest.config.mjs': 'jest.config.mjs',
     'jest.setup.js': 'jest.setup.js',
     'next.config.ts': 'next.config.ts',
+    'i18n/en.json': 'i18n/en.json',
+    'i18n/ru.json': 'i18n/ru.json',
+    'capacitor.config.ts': 'capacitor.config.ts',
     'postcss.config.mjs': 'postcss.config.mjs',
     'components.json': 'components.json',
     'tsconfig.json': 'tsconfig.json',
     'tsconfig.lib.json': 'tsconfig.lib.json',
     '.vscode/extensions.json': '.vscode/extensions.json',
-    'migrations/1746660891582-hasyx-users/up.ts': 'migrations/1746660891582-hasyx-users/up.ts',
-    'migrations/1746660891582-hasyx-users/down.ts': 'migrations/1746660891582-hasyx-users/down.ts',
-    'migrations/1746670608552-hasyx-notify/up.ts': 'migrations/1746670608552-hasyx-notify/up.ts',
-    'migrations/1746670608552-hasyx-notify/down.ts': 'migrations/1746670608552-hasyx-notify/down.ts',
-    'migrations/1746837333136-hasyx-debug/up.ts': 'migrations/1746837333136-hasyx-debug/up.ts',
-    'migrations/1746837333136-hasyx-debug/down.ts': 'migrations/1746837333136-hasyx-debug/down.ts',
-    'migrations/1748511896530-hasyx-payments/up.ts': 'migrations/1748511896530-hasyx-payments/up.ts',
-    'migrations/1748511896530-hasyx-payments/down.ts': 'migrations/1748511896530-hasyx-payments/down.ts',
-    'migrations/29991231235959999-hasyx/up.ts': 'migrations/29991231235959999-hasyx/up.ts',
-    'migrations/29991231235959999-hasyx/down.ts': 'migrations/29991231235959999-hasyx/down.ts',
+    // Events created if missing (migrations are copied as a whole earlier)
     'events/notify.json': 'events/notify.json',
-    'lib/debug.ts': 'lib/debug.template',
-    'lib/cli.ts': 'lib/cli.template',
-    'lib/github-telegram-bot.ts': 'lib/github-telegram-bot.template',
+    'events/events.json': 'events/events.json',
+    'events/subscription-billing.json': 'events/subscription-billing.json',
+    'events/logs-diffs.json': 'events/logs-diffs.json',
+    'events/github-issues.json': 'events/github-issues.json',
   };
 
   // Ensure directories exist
   const ensureDirs = [
     '.github/workflows',
     '.vscode',
-    'app/api/auth/[...nextauth]',
-    'app/api/auth/verify',
-    'app/api/graphql',
-    'migrations/1746660891582-hasyx-users',
-    'migrations/1746670608552-hasyx-notify',
-    'migrations/1746837333136-hasyx-debug',
-    'migrations/1748511896530-hasyx-payments',
-    'migrations/29991231235959999-hasyx',
-    'app/api/events/[name]',
+    'public',
     'events',
     'lib',
-    'app/api/telegram_bot',
-    'app/api/health',
-    'app/hasyx/diagnostics',
-    'app/hasyx/aframe',
-    'app/hasyx/payments',
-    'app/hasyx/cyto',
-    'app/hasyx/pwa',
-    'app/hasyx/constructor',
-    'app/hasyx/doc',
-    'app/hasyx/_doc/[filename]',
-    'components/sidebar',
-    'components/entities',
   ];
 
   debug('Ensuring directories exist:', ensureDirs);
@@ -317,20 +849,77 @@ export const initCommand = async (options: any, packageName: string = 'hasyx') =
     console.log(`✅ Ensured directory exists: ${dir}`);
   }
 
-  // Create/Replace files
-  debug('Processing files to create or replace...');
+  // Copy entire app directory from hasyx package into target project
+  try {
+    const hasyxRoot = path.resolve(__dirname, '../');
+    const appSrc = path.join(hasyxRoot, 'app');
+    const appDest = path.join(targetDir, 'app');
+    await copyDirectoryRecursive(appSrc, appDest, { overwrite: forceReinit });
+    console.log(`✅ ${forceReinit ? 'Replaced' : 'Created'}: app (copied entire directory)`);
+  } catch (error) {
+    console.warn(`⚠️ Failed to copy app directory: ${error}`);
+  }
+
+  // Copy entire migrations directory from hasyx package into target project
+  try {
+    const hasyxRoot = path.resolve(__dirname, '../');
+    const migrationsSrc = path.join(hasyxRoot, 'migrations');
+    const migrationsDest = path.join(targetDir, 'migrations');
+    await copyDirectoryRecursive(migrationsSrc, migrationsDest, { overwrite: forceReinit });
+    console.log(`✅ ${forceReinit ? 'Replaced' : 'Created'}: migrations (copied entire directory)`);
+  } catch (error) {
+    console.warn(`⚠️ Failed to copy migrations directory: ${error}`);
+  }
+
+  // Create/Replace files (non-app)
+  debug('Processing files to create or replace (non-app)...');
   for (const [targetPath, templateName] of Object.entries(filesToCreateOrReplace)) {
     const fullTargetPath = path.join(targetDir, targetPath);
-    debug(`Processing ${targetPath} -> ${templateName} (Replace)`);
     try {
+      await fs.ensureDir(path.dirname(fullTargetPath));
       const templateContent = getTemplateContent(templateName);
       await fs.writeFile(fullTargetPath, templateContent);
       console.log(`✅ Created/Replaced: ${targetPath}`);
-      debug(`Successfully wrote file: ${fullTargetPath}`);
     } catch (error) {
-       console.error(`❌ Failed to process ${targetPath} from template ${templateName}: ${error}`);
-       debug(`Error writing file ${fullTargetPath}: ${error}`);
+      console.error(`❌ Failed to process ${targetPath} from template ${templateName}: ${error}`);
     }
+  }
+  // Create a minimal .env file to avoid errors during initialization
+  try {
+    const envPath = path.join(targetDir, '.env');
+    if (!fs.existsSync(envPath)) {
+      const minimalEnvContent = `# Environment variables for ${projectName}
+# This file was auto-generated by hasyx init
+# Please configure your environment variables here
+
+# Database
+# DATABASE_URL=postgresql://user:password@localhost:5432/dbname
+
+# NextAuth
+# NEXTAUTH_SECRET=your-secret-here
+# NEXTAUTH_URL=http://localhost:3000
+
+# Hasura
+# HASURA_GRAPHQL_ENDPOINT=http://localhost:8080/v1/graphql
+# HASURA_GRAPHQL_ADMIN_SECRET=your-admin-secret
+
+# OAuth Providers (configure as needed)
+# GITHUB_ID=your-github-client-id
+# GITHUB_SECRET=your-github-client-secret
+
+# Other services
+# TELEGRAM_BOT_TOKEN=your-telegram-bot-token
+`;
+      await fs.writeFile(envPath, minimalEnvContent);
+      console.log('✅ Created: .env (with template variables)');
+      debug('Created minimal .env file with template variables');
+    } else {
+      console.log('⏩ Skipped (already exists): .env');
+      debug('.env file already exists, skipped creation');
+    }
+  } catch (error) {
+    console.warn(`⚠️ Failed to create .env file: ${error}`);
+    debug(`Error creating .env file: ${error}`);
   }
 
   // Special handling for CONTRIBUTING.md
@@ -366,6 +955,57 @@ export const initCommand = async (options: any, packageName: string = 'hasyx') =
     debug(`Error processing CONTRIBUTING.md: ${error}`);
   }
 
+  // Create .gitpod.yml for Gitpod integration
+  debug('Creating .gitpod.yml for Gitpod integration');
+  try {
+    const gitpodPath = path.join(targetDir, '.gitpod.yml');
+    const gitpodContent = `# Gitpod configuration for ${projectName}
+# This file was auto-generated by hasyx init
+
+tasks:
+  - name: Setup Hasyx
+    command: |
+      echo "🚀 Setting up Hasyx in Gitpod..."
+      npm install
+      npm run gitpod
+      echo "✅ Hasyx setup completed!"
+      echo "🚀 Starting infrastructure services..."
+      docker compose up -d
+      echo "📋 Applying database migrations..."
+      npm run migrate
+      echo "🎉 Setup complete! Run 'npm run dev' to start development server"
+      echo "💡 Note: App runs locally, Docker is used only for infrastructure"
+    init: |
+      npm install
+      npm run gitpod
+
+ports:
+  - port: 3000
+    onOpen: open-preview
+  - port: 8080
+    onOpen: open-preview
+  - port: 9000
+    onOpen: open-preview
+  - port: 9001
+    onOpen: open-preview
+
+vscode:
+  extensions:
+    - ms-vscode.vscode-typescript-next
+    - bradlc.vscode-tailwindcss
+    - esbenp.prettier-vscode
+    - ms-vscode.vscode-json
+    - ms-vscode.vscode-docker
+`;
+    
+    await fs.writeFile(gitpodPath, gitpodContent);
+    console.log('✅ Created: .gitpod.yml (for Gitpod integration)');
+    debug('Created .gitpod.yml for Gitpod integration');
+  } catch (error) {
+    console.warn(`⚠️ Failed to create .gitpod.yml: ${error}`);
+    debug(`Error creating .gitpod.yml: ${error}`);
+  }
+
   // Special handling for tsconfig files to replace 'hasyx' with project name
   const tsConfigFiles = ['tsconfig.json', 'tsconfig.lib.json'];
   debug(`Processing tsconfig files with project name replacement: ${projectName}`);
@@ -381,13 +1021,14 @@ export const initCommand = async (options: any, packageName: string = 'hasyx') =
       try {
         let templateContent = getTemplateContent(configFile);
         
+        // Replace package name mapping for the child project; do not shadow 'hasyx' package imports in child tsconfig
         templateContent = templateContent.replace(
-          /"hasyx":\s*\[\s*"\.\/lib\/index\.ts"\s*\]/g, 
+          /"hasyx":\s*\[\s*"\.\/lib\/index\.ts"\s*\]/g,
           `"${projectName}": ["./lib/index.ts"]`
         );
-        
+        // Add projectName/* mapping; do not inject local hasyx/* mapping in child project
         templateContent = templateContent.replace(
-          /"hasyx\/\*":\s*\[\s*"\.\/\*"\s*\]/g, 
+          /"hasyx\/\*":\s*\[\s*"\.\/\*"\s*\]/g,
           `"${projectName}/*": ["./*"]`
         );
         
@@ -418,6 +1059,7 @@ export const initCommand = async (options: any, packageName: string = 'hasyx') =
            const templatePath = path.join(path.resolve(__dirname, '../'), templateName);
            debug(`Copying binary file from template: ${templatePath}`);
            try {
+              await fs.ensureDir(path.dirname(fullTargetPath));
               await fs.copyFile(templatePath, fullTargetPath);
               console.log(`✅ ${exists && forceReinit ? 'Replaced' : 'Created'}: ${targetPath}`);
               debug(`Successfully copied binary file: ${fullTargetPath}`);
@@ -427,6 +1069,7 @@ export const initCommand = async (options: any, packageName: string = 'hasyx') =
            }
         } else {
           try {
+              await fs.ensureDir(path.dirname(fullTargetPath));
               const templateContent = getTemplateContent(templateName);
               await fs.writeFile(fullTargetPath, templateContent);
               console.log(`✅ ${exists && forceReinit ? 'Replaced' : 'Created'}: ${targetPath}`);
@@ -440,6 +1083,42 @@ export const initCommand = async (options: any, packageName: string = 'hasyx') =
       console.log(`⏩ Skipped (already exists): ${targetPath}`);
       debug(`File already exists, skipped: ${fullTargetPath}`);
     }
+  }
+
+  // Copy staged scaffolds (_lib and _components) if present in package
+  try {
+    const pkgRoot = path.resolve(__dirname, '../');
+    const stagedLib = path.join(pkgRoot, '_lib');
+    const stagedComponents = path.join(pkgRoot, '_components');
+    if (fs.existsSync(stagedLib)) {
+      await copyDirectoryRecursive(stagedLib, path.join(targetDir, 'lib'), { overwrite: forceReinit });
+      console.log(`✅ ${forceReinit ? 'Replaced' : 'Created'}: lib (from _lib)`);
+      // copy staged dotfiles from _lib root to project root if exist
+      for (const name of ['.gitignore', '.npmignore', '.npmrc']) {
+        const src = path.join(stagedLib, name);
+        const dst = path.join(targetDir, name);
+        if (fs.existsSync(src) && (!fs.existsSync(dst) || forceReinit)) {
+          await fs.copy(src, dst, { overwrite: true });
+          console.log(`✅ ${forceReinit ? 'Replaced' : 'Created'}: ${name}`);
+        }
+      }
+    }
+    if (fs.existsSync(stagedComponents)) {
+      // Copy only whitelisted subpaths from _components
+      const whitelist = [
+        'sidebar',
+        'entities',
+      ];
+      for (const sub of whitelist) {
+        const src = path.join(stagedComponents, sub);
+        if (!fs.existsSync(src)) continue;
+        const dst = path.join(targetDir, 'components', sub);
+        await copyDirectoryRecursive(src, dst, { overwrite: forceReinit });
+      }
+      console.log(`✅ ${forceReinit ? 'Replaced' : 'Created'}: components/sidebar, components/entities (from _components)`);
+    }
+  } catch (e) {
+    console.warn(`⚠️ Failed to copy staged templates (_lib/_components): ${e}`);
   }
 
   // Check for hasyx dependency
@@ -466,23 +1145,61 @@ export const initCommand = async (options: any, packageName: string = 'hasyx') =
   // Apply the WebSocket patch
   ensureWebSocketSupport(projectRoot);
 
-  // Ensure required npm scripts are set in package.json
+  // Ensure required npm scripts and overrides are set in package.json
+  // Overrides ensure Zod 4.x is used instead of Zod 3.x that some dependencies require
   try {
-    console.log('📝 Checking and updating npm scripts in package.json...');
+    console.log('📝 Checking and updating npm scripts and overrides in package.json...');
     const pkgJsonPath = path.join(projectRoot, 'package.json');
     if (fs.existsSync(pkgJsonPath)) {
       const pkgJson = await fs.readJson(pkgJsonPath);
+
+      // Update basic fields if they are missing
+      let basicFieldsModified = false;
       
+      if (!pkgJson.name) {
+        pkgJson.name = projectName;
+        basicFieldsModified = true;
+      }
+      
+      if (!pkgJson.version) {
+        pkgJson.version = '0.0.0';
+        basicFieldsModified = true;
+      }
+      
+      if (!pkgJson.description) {
+        pkgJson.description = `A brilliant ${pkgJson.name || projectName} project - turning ideas into reality`;
+        basicFieldsModified = true;
+      }
+      
+      if (basicFieldsModified) {
+        await fs.writeJson(pkgJsonPath, pkgJson, { spaces: 2 });
+        console.log('✅ Updated package.json with missing basic fields');
+        debug('Updated package.json with basic fields');
+      }
+
+    if (!pkgJson.engine) {
+      pkgJson.engine = {
+        node: "^22.14",
+      };
+    }
+
       if (!pkgJson.scripts) {
         pkgJson.scripts = {};
       }
+
+      // Add overrides to ensure Zod 4.x is used (required for hasyx functionality)
+      if (!pkgJson.overrides) {
+        pkgJson.overrides = {};
+      }
+      pkgJson.overrides.zod = "^4.0.15";
       
       const requiredScripts = {
-        "test": "NODE_OPTIONS=\"--experimental-vm-modules\" jest --verbose --runInBand",
+        "test": "npm run unbuild; NODE_OPTIONS=\"--experimental-vm-modules\" jest --verbose --runInBand",
         "build": `NODE_ENV=production npx -y ${packageName} build`,
         "unbuild": `npx -y ${packageName} unbuild`,
         "start": `NODE_ENV=production NODE_OPTIONS=\"--experimental-vm-modules\" npx -y ${packageName} start`,
         "dev": `NODE_OPTIONS=\"--experimental-vm-modules\" npx -y ${packageName} dev`,
+        "client": `npx ${packageName} client`,
         "doc:build": `NODE_OPTIONS=\"--experimental-vm-modules\" npx ${packageName} doc`,
         "ws": "npx --yes next-ws-cli@latest patch -y",
         "postinstall": "npm run ws -- -y",
@@ -490,14 +1207,38 @@ export const initCommand = async (options: any, packageName: string = 'hasyx') =
         "unmigrate": `npx ${packageName} unmigrate`,
         "events": `NODE_OPTIONS=\"--experimental-vm-modules\" npx ${packageName} events`,
         "schema": `npx ${packageName} schema`,
+        "vercel": `npx ${packageName} vercel`,
+        "github": `npx ${packageName} github`,
+        "init:android": "node -e \"process.exit(require('fs').existsSync('android')?0:1)\" || npx cap add android",
+        "init:ios": "node -e \"process.exit(require('fs').existsSync('ios/App')?0:1)\" || npx cap add ios",
+        "build:android": "npm run init:android && npm run client && npm run cli -- assets && npx cap sync android",
+        "open:android": "npx cap open android",
+        "build:ios": "npm run init:ios && npm run client && npm run cli -- assets && npx cap sync ios",
+        "open:ios": "npx cap open ios",
         "npm-publish": "npm run build && npm publish",
         "cli": `NODE_OPTIONS=\"--experimental-vm-modules\" npx ${packageName}`,
-        "assist": `NODE_OPTIONS=\"--experimental-vm-modules\" npx ${packageName} assist`,
+        "telegram": `NODE_OPTIONS=\"--experimental-vm-modules\" npx ${packageName} telegram`,
         "js": `NODE_OPTIONS=\"--experimental-vm-modules\" npx ${packageName} js`,
-        "tsx": `NODE_OPTIONS=\"--experimental-vm-modules\" npx ${packageName} tsx`
+        "tsx": `NODE_OPTIONS=\"--experimental-vm-modules\" npx ${packageName} tsx`,
+        "logs": `npx ${packageName} logs`,
+        "logs-diffs": `npx ${packageName} logs-diffs`,
+        "logs-states": `npx ${packageName} logs-states`,
+        "config": `npx ${packageName} config`,
+        "validation": `npx ${packageName} validation define`,
+        "env": `npx ${packageName} env`,
+        "gitpod": `npx ${packageName} gitpod`
+      };
+      
+      // Ensure React runtime dependencies are present in child project
+      const requiredDependencies: Record<string, string> = {
+        react: "19.1.1",
+        "react-dom": "19.1.1",
       };
       
       let scriptsModified = false;
+      let overridesModified = false;
+      let dependenciesModified = false;
+      let devDependenciesModified = false;
       
       for (const [scriptName, scriptValue] of Object.entries(requiredScripts)) {
         if (!pkgJson.scripts[scriptName] || pkgJson.scripts[scriptName] !== scriptValue) {
@@ -505,25 +1246,85 @@ export const initCommand = async (options: any, packageName: string = 'hasyx') =
           scriptsModified = true;
         }
       }
-      
-      if (scriptsModified) {
-        await fs.writeJson(pkgJsonPath, pkgJson, { spaces: 2 });
-        console.log('✅ Required npm scripts updated in package.json.');
-      } else {
-        console.log('ℹ️ Required npm scripts already present in package.json.');
+
+      // Add or update required dependencies; move from devDependencies if necessary
+      if (!pkgJson.dependencies) {
+        pkgJson.dependencies = {};
       }
-    } else {
-      console.warn('⚠️ package.json not found in project root. Unable to update npm scripts.');
+      for (const [depName, depVersion] of Object.entries(requiredDependencies)) {
+        const currentDepVersion: string | undefined = pkgJson.dependencies[depName];
+        const currentDevDepVersion: string | undefined = pkgJson.devDependencies?.[depName];
+        if (currentDevDepVersion) {
+          delete pkgJson.devDependencies[depName];
+        }
+        if (!currentDepVersion || currentDepVersion !== depVersion || currentDevDepVersion) {
+          pkgJson.dependencies[depName] = depVersion;
+          dependenciesModified = true;
+        }
+      }
+
+      // Ensure required devDependencies for Jest + ts-jest are present in child project
+      const requiredDevDependencies: Record<string, string> = {
+        jest: "29.7.0",
+        "ts-jest": "29.1.2",
+        "@types/jest": "29.5.12",
+      };
+
+      if (!pkgJson.devDependencies) {
+        pkgJson.devDependencies = {};
+      }
+      for (const [depName, depVersion] of Object.entries(requiredDevDependencies)) {
+        const currentDevDepVersion: string | undefined = pkgJson.devDependencies[depName];
+        if (!currentDevDepVersion || currentDevDepVersion !== depVersion) {
+          pkgJson.devDependencies[depName] = depVersion;
+          devDependenciesModified = true;
+        }
+      }
+
+      // Check if overrides need to be updated
+      if (!pkgJson.overrides?.zod || pkgJson.overrides.zod !== "^4.0.15") {
+        if (!pkgJson.overrides) {
+          pkgJson.overrides = {};
+        }
+        pkgJson.overrides.zod = "^4.0.15";
+        overridesModified = true;
+      }
+      
+      if (scriptsModified || overridesModified || dependenciesModified || devDependenciesModified) {
+        await fs.writeJson(pkgJsonPath, pkgJson, { spaces: 2 });
+        if (scriptsModified && overridesModified && dependenciesModified && devDependenciesModified) {
+          console.log('✅ Required npm scripts, overrides, and dependencies updated in package.json.');
+        } else if (scriptsModified) {
+          console.log('✅ Required npm scripts updated in package.json.');
+        } else if (overridesModified) {
+          console.log('✅ Required overrides updated in package.json.');
+        } else if (dependenciesModified) {
+          console.log('✅ Required dependencies updated in package.json.');
+        } else if (devDependenciesModified) {
+          console.log('✅ Required devDependencies updated in package.json.');
+        }
+      } else {
+        console.log('ℹ️ Required npm scripts and overrides already present in package.json.');
+      }
     }
   } catch (error) {
     console.warn('⚠️ Failed to update npm scripts in package.json:', error);
     debug(`Error updating npm scripts in package.json: ${error}`);
   }
 
-  // Install/Update hasyx itself
-  console.log(`📦 Ensuring the latest version of ${packageName} is installed...`);
-  debug(`Running command: npm install ${packageName}@latest --save`);
-  const installHasyxResult = spawn.sync('npm', ['install', `${packageName}@latest`, '--save'], {
+  // Do not auto-install dependencies here; use npm ci in the child project
+
+  // Install/Update hasyx itself (allow override source via env)
+  const localTgz = process.env.HASYX_INSTALL_TGZ;
+  const localDir = process.env.HASYX_INSTALL_DIR;
+  const installArg = localTgz && fs.existsSync(path.resolve(targetDir, localTgz))
+    ? path.resolve(targetDir, localTgz)
+    : (localDir && fs.existsSync(path.resolve(targetDir, localDir))
+      ? path.resolve(targetDir, localDir)
+      : `${packageName}@latest`);
+  console.log(`📦 Ensuring ${packageName} is installed (${installArg === `${packageName}@latest` ? 'registry' : 'local'})...`);
+  debug(`Running command: npm install ${installArg} --save`);
+  const installHasyxResult = spawn.sync('npm', ['install', installArg, '--save'], {
     stdio: 'inherit',
     cwd: projectRoot,
   });
@@ -540,14 +1341,27 @@ export const initCommand = async (options: any, packageName: string = 'hasyx') =
     debug(`npm install ${packageName}@latest --save successful.`);
   }
 
-  // Build documentation for the project
-  console.log('📚 Building documentation...');
-  try {
-    buildDocumentation(projectRoot);
-  } catch (error) {
-    console.warn('⚠️ Failed to build documentation:', error);
-    debug(`Documentation build failed: ${error}`);
+  // Create hasyx.config.json if it doesn't exist
+  const configPath = path.join(projectRoot, 'hasyx.config.json');
+  if (!fs.existsSync(configPath)) {
+    console.log('📝 Creating hasyx.config.json with Docker configuration...');
+    try {
+      const dockerConfig = await generateDockerConfig();
+      await fs.writeJson(configPath, dockerConfig, { spaces: 2 });
+      console.log('✅ hasyx.config.json created successfully');
+      
+      // Generate .env and docker-compose.yml using existing functions
+      console.log('📝 Generating .env and docker-compose.yml...');
+      await generateEnvAndDockerCompose();
+    } catch (error) {
+      console.warn('⚠️ Failed to create hasyx.config.json:', error);
+      debug(`Error creating hasyx.config.json: ${error}`);
+    }
+  } else {
+    debug('hasyx.config.json already exists, skipping creation');
   }
+
+  // Documentation generation removed
 
   console.log(`✨ ${packageName} initialization complete!`);
 
@@ -563,20 +1377,19 @@ export const devCommand = () => {
   debug('Executing "dev" command.');
   const cwd = process.cwd();
   
-  // Build documentation before starting dev server
-  console.log('📚 Building documentation...');
-  try {
-    buildDocumentation(cwd);
-  } catch (error) {
-    console.warn('⚠️ Failed to build documentation:', error);
-    debug(`Documentation build failed: ${error}`);
-  }
+  // Documentation generation removed
   
   console.log('🚀 Starting development server (using next dev --turbopack)...');
-  debug(`Running command: npx next dev --turbopack in ${cwd}`);
-  const result = spawn.sync('npx', ['next', 'dev', '--turbopack'], {
+  const devArgs = ['next', 'dev', '--turbopack'];
+  const portEnv = process.env.PORT || process.env.NEXT_PORT || process.env.APP_PORT;
+  if (portEnv) {
+    devArgs.push('-p', String(portEnv));
+  }
+  debug(`Running command: npx ${devArgs.join(' ')} in ${cwd}`);
+  const result = spawn.sync('npx', devArgs, {
     stdio: 'inherit',
     cwd: cwd,
+    env: { ...process.env, PORT: portEnv || process.env.PORT },
   });
   debug('next dev --turbopack result:', JSON.stringify(result, null, 2));
   if (result.error) {
@@ -595,17 +1408,9 @@ export const devCommand = () => {
 export const buildCommand = () => {
   debug('Executing "build" command.');
   const cwd = process.cwd();
-  
   ensureWebSocketSupport(cwd);
   
-  // Build documentation before building Next.js app
-  console.log('📚 Building documentation...');
-  try {
-    buildDocumentation(cwd);
-  } catch (error) {
-    console.warn('⚠️ Failed to build documentation:', error);
-    debug(`Documentation build failed: ${error}`);
-  }
+  // Documentation generation removed
   
   console.log('🏗️ Building Next.js application...');
   debug(`Running command: npx next build --turbopack in ${cwd}`);
@@ -633,10 +1438,16 @@ export const startCommand = () => {
   const cwd = process.cwd();
   
   console.log('🛰️ Starting production server (using next start)...');
-  debug(`Running command: npx next start --turbopack in ${cwd}`);
-   const result = spawn.sync('npx', ['next', 'start', '--turbopack'], {
+  const startArgs = ['next', 'start', '--turbopack'];
+  const startPortEnv = process.env.PORT || process.env.NEXT_PORT || process.env.APP_PORT;
+  if (startPortEnv) {
+    startArgs.push('-p', String(startPortEnv));
+  }
+  debug(`Running command: npx ${startArgs.join(' ')} in ${cwd}`);
+  const result = spawn.sync('npx', startArgs, {
     stdio: 'inherit',
     cwd: cwd,
+    env: { ...process.env, PORT: startPortEnv || process.env.PORT },
   });
   debug('next start --turbopack result:', JSON.stringify(result, null, 2));
   if (result.error) {
@@ -653,7 +1464,7 @@ export const startCommand = () => {
 };
 
 export const buildClientCommand = async () => {
-  debug('Executing "build:client" command via CLI.');
+  debug('Executing "client" command via CLI.');
   const cwd = process.cwd();
   
   console.log('📦 Building Next.js application for client export...');
@@ -662,7 +1473,7 @@ export const buildClientCommand = async () => {
   try {
     await buildClient();
     console.log('✅ Client build completed successfully!');
-    debug('Finished executing "build:client" command via CLI.');
+    debug('Finished executing "client" command via CLI.');
   } catch (error) {
     console.error('❌ Client build failed:', error);
     debug(`Error in buildClient command: ${error}`);
@@ -769,6 +1580,7 @@ export const jsCommand = async (filePath: string | undefined, options: any) => {
   debug('Executing "js" command with filePath:', filePath, 'and options:', options);
   
   try {
+    const { runJsEnvironment } = await import('./js');
     await runJsEnvironment(filePath, options.eval);
   } catch (error) {
     console.error('❌ Error executing JS environment:', error);
@@ -777,73 +1589,15 @@ export const jsCommand = async (filePath: string | undefined, options: any) => {
   }
 };
 
-// Ask command
-export const askCommand = async (options: any) => {
-  debug('Executing "ask" command with options:', options);
-  
-  // Check and setup OPENROUTER_API_KEY if needed
-  await ensureOpenRouterApiKey();
-
-  try {
-    // Always use Hasyx's ask module
-    debug('Using default Hasyx ask.ts with streaming support');
-
-    if (options.eval) {
-      // Direct question mode with beautiful streaming output
-      const response = await ask.askWithBeautifulOutput(options.eval);
-      // Response is already printed with beautiful markdown formatting
-      debug('Direct question completed with streaming output');
-    } else {
-      // Interactive REPL mode with real-time streaming
-      await ask.repl();
-    }
-  } catch (error) {
-    console.error('❌ Error in ask command:', error);
-    debug('Ask command error:', error);
-    process.exit(1);
-  }
-};
+// Ask command is now exported from ask.ts
 
 /**
  * Ensures OPENROUTER_API_KEY is available, setting it up interactively if needed
  */
 async function ensureOpenRouterApiKey() {
-  if (!process.env.OPENROUTER_API_KEY) {
-    console.log('🔑 OpenRouter API Key not found. Let\'s set it up...');
-    
-    try {
-      const { configureOpenRouter } = await import('./assist-openrouter');
-      const { createRlInterface } = await import('./assist-common');
-      const path = await import('path');
-      const dotenv = await import('dotenv');
-      
-      const rl = createRlInterface();
-      const envPath = path.join(process.cwd(), '.env');
-      
-      try {
-        await configureOpenRouter(rl, envPath);
-        
-        // Reload environment variables
-        const envResult = dotenv.config({ path: envPath });
-        if (envResult.error) {
-          console.debug('Warning: Could not reload .env file:', envResult.error);
-        }
-        
-        // Check if the key is now available
-        if (!process.env.OPENROUTER_API_KEY) {
-          console.error('❌ OPENROUTER_API_KEY is still not available. Please check your .env file.');
-          process.exit(1);
-        }
-        
-        console.log('✅ OpenRouter API Key configured successfully!');
-      } finally {
-        rl.close();
-      }
-    } catch (error) {
-      console.error('❌ Failed to configure OpenRouter API Key:', error);
-      process.exit(1);
-    }
-  }
+  if (process.env.OPENROUTER_API_KEY) return;
+  console.log('🔑 OPENROUTER_API_KEY not found. Skipping interactive setup in this build.');
+  console.log('   Set OPENROUTER_API_KEY in your .env if you intend to use OpenRouter.');
 }
 
 // TSX command
@@ -851,6 +1605,7 @@ export const tsxCommand = async (filePath: string | undefined, options: any) => 
   debug('Executing "tsx" command with filePath:', filePath, 'and options:', options);
   
   try {
+    const { runTsxEnvironment } = await import('./tsx');
     await runTsxEnvironment(filePath, options.eval);
   } catch (error) {
     console.error('❌ Error executing TSX environment:', error);
@@ -860,26 +1615,17 @@ export const tsxCommand = async (filePath: string | undefined, options: any) => 
 };
 
 // Doc command
-export const docCommand = (options: any) => {
-  debug('Executing "doc" command with options:', options);
-  try {
-    buildDocumentation(options.dir);
-  } catch (error) {
-    console.error('❌ Failed to build documentation:', error);
-    debug(`Documentation build failed: ${error}`);
-    process.exit(1);
-  }
-};
+// doc command removed
 
 // Helper function to validate environment variables for subdomain management
 const validateSubdomainEnv = (): { domain: string; cloudflare: CloudflareConfig } => {
   const missingVars: string[] = [];
   
-  const domain = process.env.HASYX_DNS_DOMAIN || process.env.DOMAIN;
+  const domain = process.env.HASYX_DNS_DOMAIN;
   const apiToken = process.env.CLOUDFLARE_API_TOKEN;
   const zoneId = process.env.CLOUDFLARE_ZONE_ID;
   
-  if (!domain) missingVars.push('HASYX_DNS_DOMAIN or DOMAIN');
+  if (!domain) missingVars.push('HASYX_DNS_DOMAIN');
   if (!apiToken) missingVars.push('CLOUDFLARE_API_TOKEN');
   if (!zoneId) missingVars.push('CLOUDFLARE_ZONE_ID');
   
@@ -888,7 +1634,7 @@ const validateSubdomainEnv = (): { domain: string; cloudflare: CloudflareConfig 
     missingVars.forEach(variable => {
       console.error(`   ${variable}`);
     });
-    console.error('\n💡 To configure these variables, run: npx hasyx assist');
+    console.error('\n💡 Configure these via hasyx.config.json (dns/cloudflare) and regenerate .env');
     process.exit(1);
   }
   
@@ -1239,6 +1985,37 @@ export const dockerEnvCommand = async (port: string) => {
   }
 };
 
+// Logs commands
+export const logsCommand = async () => {
+  debug('Executing "logs" command.');
+  try {
+    await processLogs();
+  } catch (error) {
+    console.error('❌ Failed to process logs configuration:', error);
+    process.exit(1);
+  }
+};
+
+export const logsDiffsCommand = async () => {
+  debug('Executing "logs-diffs" command.');
+  try {
+    await processConfiguredDiffs();
+  } catch (error) {
+    console.error('❌ Failed to process logs-diffs configuration:', error);
+    process.exit(1);
+  }
+};
+
+export const logsStatesCommand = async () => {
+  debug('Executing "logs-states" command.');
+  try {
+    await processConfiguredStates();
+  } catch (error) {
+    console.error('❌ Failed to process logs-states configuration:', error);
+    process.exit(1);
+  }
+};
+
 // Command descriptor functions
 export const initCommandDescribe = (cmd: Command) => {
   return cmd
@@ -1300,31 +2077,69 @@ export const unbuildCommandDescribe = (cmd: Command) => {
   return cmd.description('Remove compiled files (.js, .d.ts) from lib, components, and hooks directories only (preserves types directory), and delete tsconfig.lib.tsbuildinfo.');
 };
 
-export const assistCommandDescribe = (cmd: Command) => {
-  return cmd
-    .description('Interactive assistant to set up hasyx project with GitHub, Hasura, and Vercel')
-    .option('--skip-auth', 'Skip GitHub authentication check')
-    .option('--skip-repo', 'Skip repository setup')
-    .option('--skip-env', 'Skip environment setup')
-    .option('--skip-package', 'Skip package.json setup')
-    .option('--skip-init', 'Skip hasyx initialization')
-    .option('--skip-hasura', 'Skip Hasura configuration')
-    .option('--skip-secrets', 'Skip authentication secrets setup')
-    .option('--skip-oauth', 'Skip OAuth configuration')
-    .option('--skip-resend', 'Skip Resend configuration')
-    .option('--skip-vercel', 'Skip Vercel setup')
-    .option('--skip-sync', 'Skip environment variable sync')
-    .option('--skip-commit', 'Skip commit step')
-    .option('--skip-migrations', 'Skip migrations check');
-};
+// assist command removed
 
 export const telegramCommandDescribe = (cmd: Command) => {
-  return cmd
-    .description('Setup and calibrate Telegram Bot, Admin Group, and Announcement Channel.')
-    .option('--skip-bot', 'Skip interactive Telegram Bot setup (token, name, webhook, etc.)')
-    .option('--skip-admin-group', 'Skip Telegram Admin Group setup (chat_id for correspondence)')
-    .option('--skip-channel', 'Skip Telegram Announcement Channel setup (channel_id, project user link)')
-    .option('--skip-calibration', 'Skip Telegram bot calibration process');
+  const group = cmd
+    .description('Telegram bot operations');
+  group.addHelpText('after', '\nLegacy: Deprecated interactive setup is removed; use subcommands.');
+  group
+    .command('sync')
+    .description('Sync Telegram settings from current variant: set webhook, menu button, and commands')
+    .action(async () => {
+      // Ensure .env exists and load it
+      try {
+        const { generateEnv } = await import('./config/env');
+        await generateEnv();
+      } catch {}
+      const parse = (fp: string) => {
+        const env: Record<string,string> = {};
+        try {
+          const content = require('fs').readFileSync(fp, 'utf-8');
+          for (const line of content.split('\n')) {
+            const t = line.trim();
+            if (!t || t.startsWith('#')) continue;
+            const i = t.indexOf('=');
+            if (i <= 0) continue;
+            env[t.slice(0,i).trim()] = t.slice(i+1).trim();
+          }
+        } catch {}
+        return env;
+      };
+      const env = parse('.env');
+      const baseUrl = env.NEXT_PUBLIC_API_URL || env.NEXT_PUBLIC_MAIN_URL || env.NEXT_PUBLIC_BASE_URL;
+      if (!baseUrl) {
+        console.error('❌ Base URL not found in .env (NEXT_PUBLIC_API_URL/NEXT_PUBLIC_MAIN_URL/NEXT_PUBLIC_BASE_URL)');
+        process.exit(1);
+      }
+      const webhookUrl = `${baseUrl.replace(/\/$/, '')}/api/telegram_bot`;
+      const projectName = env.NEXT_PUBLIC_APP_NAME || 'App';
+      try {
+        await tgCalibrate({ webhookUrl, projectName });
+        console.log(`✅ Telegram synchronized: webhook=${webhookUrl}`);
+      } catch (e) {
+        console.error('❌ Telegram sync failed:', e);
+        process.exit(1);
+      }
+    });
+  group
+    .command('webhook-define <url>')
+    .description('Set Telegram webhook URL')
+    .action(async (url: string) => { await tgSetWebhook(url); console.log('✅ Webhook defined'); });
+  group
+    .command('webhook-undefine')
+    .description('Remove Telegram webhook')
+    .action(async () => { await tgRemoveWebhook(); console.log('✅ Webhook removed'); });
+  group
+    .command('calibrate')
+    .description('Calibrate Telegram bot (webhook/menu/commands)')
+    .option('--project <name>', 'Project name for menu button')
+    .option('--webhook <url>', 'Webhook URL to set before calibration')
+    .action(async (options: { project?: string; webhook?: string }) => {
+      await tgCalibrate({ projectName: options.project, webhookUrl: options.webhook });
+      console.log('✅ Bot calibrated');
+    });
+  return group;
 };
 
 export const localCommandDescribe = (cmd: Command) => {
@@ -1332,7 +2147,18 @@ export const localCommandDescribe = (cmd: Command) => {
 };
 
 export const vercelCommandDescribe = (cmd: Command) => {
-  return cmd.description('Switch environment URL variables to Vercel deployment');
+  const group = cmd.description('Vercel operations')
+    .addHelpText('after', `\nExamples:\n  npx hasyx vercel sync\n  npx hasyx vercel clear\n  npm run cli -- vercel --help`);
+  // legacy note removed
+  group
+    .command('sync')
+    .description('Purge and sync Vercel environment variables from .env')
+    .action(vercelSyncCommand);
+  group
+    .command('clear')
+    .description('Remove all Vercel environment variables across production/preview/development (no re-add)')
+    .action(vercelClearCommand);
+  return group;
 };
 
 export const jsCommandDescribe = (cmd: Command) => {
@@ -1341,13 +2167,7 @@ export const jsCommandDescribe = (cmd: Command) => {
     .option('-e, --eval <script>', 'Evaluate a string of JavaScript code');
 };
 
-export const askCommandDescribe = (cmd: Command) => {
-  return cmd
-    .description('AI assistant with code execution capabilities')
-    .option('-e, --eval <question>', 'Execute a direct question')
-    .option('-y, --yes', 'Auto-approve code execution (no confirmation)')
-    .option('-m, --model <model>', 'Specify OpenRouter model');
-};
+// askCommandDescribe is now exported from ask.ts
 
 export const tsxCommandDescribe = (cmd: Command) => {
   return cmd
@@ -1367,12 +2187,12 @@ Examples:
 
 Requirements:
   Environment variables needed:
-    HASYX_DNS_DOMAIN (or DOMAIN)    - Your domain name
+    HASYX_DNS_DOMAIN                - Your domain name
     CLOUDFLARE_API_TOKEN            - CloudFlare API token
     CLOUDFLARE_ZONE_ID              - CloudFlare Zone ID
     LETSENCRYPT_EMAIL (optional)    - Email for SSL certificates
 
-  Configure these with: npx hasyx assist
+   Configure via hasyx.config.json (dns/cloudflare) and regenerate .env
 `);
 
   // Add subcommands
@@ -1392,6 +2212,22 @@ Requirements:
     .action(subdomainUndefineCommand);
 
   return subCmd;
+};
+
+export const logsCommandDescribe = (cmd: Command) => {
+  return cmd.description('Apply logs configuration from hasyx.config.json (includes both diffs and states)');
+};
+
+export const logsDiffsCommandDescribe = (cmd: Command) => {
+  return cmd.description('Apply logs-diffs configuration from hasyx.config.json');
+};
+
+export const logsStatesCommandDescribe = (cmd: Command) => {
+  return cmd.description('Apply logs-states configuration from hasyx.config.json');
+};
+
+export const envCommandDescribe = (cmd: Command) => {
+  return cmd.description('Update environment variables in docker-compose.yml and restart running container if needed');
 };
 
 export const dockerCommandDescribe = (cmd: Command) => {
@@ -1474,7 +2310,7 @@ export const setupCommands = (program: Command, packageName: string = 'hasyx') =
   startCommandDescribe(program.command('start')).action(startCommand);
 
   // Build client command
-  buildClientCommandDescribe(program.command('build:client')).action(buildClientCommand);
+  buildClientCommandDescribe(program.command('client')).action(buildClientCommand);
 
   // Migrate command
   migrateCommandDescribe(program.command('migrate')).action(async (filter) => {
@@ -1489,8 +2325,7 @@ export const setupCommands = (program: Command, packageName: string = 'hasyx') =
   // Schema command
   schemaCommandDescribe(program.command('schema')).action(schemaCommand);
 
-  // Doc command
-  docCommandDescribe(program.command('doc')).action(docCommand);
+  // Doc command removed
 
   // Assets command
   assetsCommandDescribe(program.command('assets')).action(async () => {
@@ -1507,19 +2342,14 @@ export const setupCommands = (program: Command, packageName: string = 'hasyx') =
     await unbuildCommand();
   });
 
-  // Assist command
-  assistCommandDescribe(program.command('assist')).action((options) => {
-    assist.default(options);
-  });
+  // Assist command removed
 
   // Telegram command
   telegramCommandDescribe(program.command('telegram')).action(async (options) => {
-    if (!runTelegramSetupAndCalibration) {
-        console.error('FATAL: runTelegramSetupAndCalibration function not found in assist module. Build might be corrupted or export is missing.');
-        process.exit(1);
-    }
-    runTelegramSetupAndCalibration(options);
+    // actions are implemented in telegramCommandDescribe; no legacy assist calls
   });
+
+  // Storage command removed (configure via hasyx.config.json)
 
   // Local command
   localCommandDescribe(program.command('local')).action(async () => {
@@ -1534,8 +2364,14 @@ export const setupCommands = (program: Command, packageName: string = 'hasyx') =
   // JS command
   jsCommandDescribe(program.command('js [filePath]')).action(jsCommand);
 
-  // Ask command
-  askCommandDescribe(program.command('ask')).action(askCommand);
+  // Ask command (lazy import to avoid pulling heavy AI deps unless used)
+  program
+    .command('ask')
+    .description('Interactive AI ask CLI')
+    .action(async () => {
+      const mod = await import('./ask');
+      await mod.askCommand({});
+    });
 
   // TSX command
   tsxCommandDescribe(program.command('tsx [filePath]')).action(tsxCommand);
@@ -1543,8 +2379,76 @@ export const setupCommands = (program: Command, packageName: string = 'hasyx') =
   // Subdomain command
   subdomainCommandDescribe(program.command('subdomain'));
 
+  // Logs command
+  logsCommandDescribe(program.command('logs')).action(async () => {
+    await logsCommand();
+  });
+
+  // Logs-diffs command
+  logsDiffsCommandDescribe(program.command('logs-diffs')).action(async () => {
+    await logsDiffsCommand();
+  });
+
+  // Logs-states command
+  logsStatesCommandDescribe(program.command('logs-states')).action(async () => {
+    await logsStatesCommand();
+  });
+
+  // Env command
+  envCommandDescribe(program.command('env')).action(async () => {
+    console.log('🚀 CLI: Starting env command...');
+    try {
+      await envCommand();
+      console.log('✅ CLI: Env command completed successfully');
+    } catch (error) {
+      console.error('❌ CLI: Env command failed:', error);
+      process.exit(1);
+    }
+  });
+
+  // Config command
+  program
+    .command('config')
+    .description('Open interactive configuration UI or generate files in silent mode')
+    .option('--silent', 'Run in silent mode: only generate .env and docker-compose.yml and exit')
+    .action(async (opts: { silent?: boolean }) => {
+      await configCommand({ silent: !!opts?.silent });
+    });
+
+  // Gitpod command
+  program
+    .command('gitpod')
+    .description('Automatically configure Hasyx for Gitpod environment')
+    .action(async () => {
+      await gitpodCommand();
+    });
+
   // Docker command
   dockerCommandDescribe(program.command('docker'));
+
+  // Validation command group
+  const validationGroup = program.command('validation').description('Validation: full sync of schemas, options triggers and config rules');
+  validationGroup
+    .command('sync')
+    .description('Full sync: schemas from schema.tsx + options triggers + rules from hasyx.config.json')
+    .action(async () => {
+      await processFullValidationSync();
+    });
+  validationGroup
+    .command('define')
+    .description('[DEPRECATED] Use "validation sync" instead of this command')
+    .action(async () => {
+      await processConfiguredValidationDefine();
+    });
+  validationGroup
+    .command('undefine')
+    .description('Remove all validation triggers created by hasyx')
+    .action(async () => {
+      await processConfiguredValidationUndefine();
+    });
+
+  // GitHub command
+  githubCommandDescribe(program.command('github'));
 
   return program;
 }; 

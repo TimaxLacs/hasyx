@@ -9,29 +9,38 @@ Hasyx = Next.js + Hasura + auth + client + building
 Hasyx provides a robust starting point and a set of tools for building applications using Next.js (App Router), Hasura, and strong authentication patterns. It simplifies setup with JWT-based authentication via NextAuth.js, a secure GraphQL proxy to Hasura, direct WebSocket support for subscriptions, and a powerful dynamic query generator.
 
 [![Live Demo](https://img.shields.io/badge/Live%20Demo-%F0%9F%9A%80-brightgreen)](https://hasyx.vercel.app/)
+[![AI Architecture Docs](https://img.shields.io/badge/AI%20Architecture-MD-red)](AI.md)
+[![AI Assistant CLI Docs](https://img.shields.io/badge/AI%20Assistant%20CLI-MD-blue)](ASK.md)
+[![Ollama Integration Docs](https://img.shields.io/badge/Ollama%20Integration-MD-orange)](OLLAMA.md)
+[![OpenRouter Integration Docs](https://img.shields.io/badge/OpenRouter%20Integration-MD-green)](OPENROUTER.md)
 [![Generator Documentation](https://img.shields.io/badge/Generator%20Docs-MD-blue)](GENERATOR.md) 
 [![Constructor Documentation](https://img.shields.io/badge/Constructor%20Docs-MD-teal)](CONSTRUCTOR.md)
 [![Apollo Client Documentation](https://img.shields.io/badge/Apollo%20Client%20Docs-MD-orange)](APOLLO.md)
-[![Authentication Helpers Documentation](https://img.shields.io/badge/Auth%20Helpers%20Docs-MD-green)](AUTH.md) [![Hasura Admin Client Documentation](https://img.shields.io/badge/Hasura%20Client%20Docs-MD-purple)](HASURA.md)
-[![Generated Client Documentation](https://img.shields.io/badge/Generated%20Hasyx%20Docs-MD-cyan)](HASYX.md)
+[![Authentication Helpers Documentation](https://img.shields.io/badge/Auth%20Helpers%20Docs-MD-green)](AUTH.md) [![JWT Authentication Documentation](https://img.shields.io/badge/JWT%20Auth-MD-blue)](AUTH.md#jwt-auth-local-storage-without-session) [![Hasura Admin Client Documentation](https://img.shields.io/badge/Hasura%20Client%20Docs-MD-purple)](HASURA.md)
+[![Generated Client Documentation](https://img.shields.io/badge/Generated%20Hasyx%20Docs-MD-cyan)](HASYX.md) [![Geo Module Documentation](https://img.shields.io/badge/Geo%20Module-MD-green)](GEO.md)
 [![GraphQL Proxy Documentation](https://img.shields.io/badge/GraphQL%20Proxy%20Docs-MD-yellow)](GRAPHQL-PROXY.md)
 [![Code Execution Engine Documentation](https://img.shields.io/badge/Exec%20Engine-MD-darkgreen)](EXEC.md)
 [![TypeScript Execution Engine Documentation](https://img.shields.io/badge/ExecTs%20Engine-MD-darkblue)](EXEC-TS.md)
 [![Terminal Library Documentation](https://img.shields.io/badge/Terminal%20Library-MD-indigo)](TERMINAL.md)
-[![OpenRouter AI Integration Documentation](https://img.shields.io/badge/OpenRouter%20AI-MD-brightgreen)](OPENROUTER.md)
-[![Cytoscape Integration Documentation](https://img.shields.io/badge/Cyto%20Docs-MD-red)](CYTO.md)
-[![Hasyx Identifier (HID) Documentation](https://img.shields.io/badge/HID%20Docs-MD-lightgrey)](HID.md)
 [![Notifications System Documentation](https://img.shields.io/badge/Notify%20System-MD-blueviolet)](NOTIFY.md)
 [![Firebase Notifications Documentation](https://img.shields.io/badge/Notify%20Firebase-MD-gold)](NOTIFY-FIREBASE.md)
 [![Telegram Bot Notifications Documentation](https://img.shields.io/badge/Notify%20Telegram%20Bot-MD-skyblue)](NOTIFY-TELEGRAM-BOT.md)
 [![GitHub Telegram Bot Integration Documentation](https://img.shields.io/badge/GitHub%20Telegram%20Bot-MD-brightgreen)](TELEGRAM_BOT.md)
 [![PWA Support Documentation](https://img.shields.io/badge/PWA%20Support-MD-9cf)](PWA.md)
+[![Schedule System Documentation](https://img.shields.io/badge/Schedule%20System-MD-purple)](SCHEDULE.md)
+[![Logs System Documentation](https://img.shields.io/badge/Logs%20System-MD-brown)](LOGS.md)
+[![Messaging System Documentation](https://img.shields.io/badge/Messaging%20System-MD-darkslateblue)](MESSAGING.md) [![Groups System Documentation](https://img.shields.io/badge/Groups%20System-MD-darkslategray)](GROUPS.md)
 [![TBank Payments Documentation](https://img.shields.io/badge/TBank%20Payments-MD-ff69b4)](TBANK.md)
 [![Tinkoff API Base Documentation](https://img.shields.io/badge/Tinkoff%20API-MD-lightpink)](TINKOFF_API.md)
 [![CloudFlare DNS Management Documentation](https://img.shields.io/badge/CloudFlare%20DNS-MD-orange)](CLOUDFLARE.md)
 [![SSL Certificate Management Documentation](https://img.shields.io/badge/SSL%20Certificates-MD-green)](SSL.md)
 [![Nginx Configuration Documentation](https://img.shields.io/badge/Nginx%20Config-MD-blue)](NGINX.md)
 [![Subdomain Management Documentation](https://img.shields.io/badge/Subdomain%20Manager-MD-purple)](SUBDOMAIN.md)
+[![Docker Hub Publishing Documentation](https://img.shields.io/badge/Docker%20Hub-MD-blue)](DOCKER.md)
+[![URL Query State Management Documentation](https://img.shields.io/badge/Use%20Query%20Hook-MD-lightblue)](USE-QUERY.md)
+[![Files Storage Documentation](https://img.shields.io/badge/Files%20Storage-MD-darkgreen)](FILES.md)
+[![plv8 Extension Documentation](https://img.shields.io/badge/plv8%20Extension-MD-darkred)](PLV8.md) [![Validation (plv8+Zod) Docs](https://img.shields.io/badge/Validation-MD-darkred)](VALIDATION.md) [![Options System](https://img.shields.io/badge/Options%20System-MD-darkgreen)](OPTIONS.md) [![Items & Inheritance System](https://img.shields.io/badge/Items%20System-MD-forestgreen)](ITEMS.md)
+[![Fastlane Integration Documentation](https://img.shields.io/badge/Fastlane%20Integration-MD-orange)](FASTLANE.md)
 
 ## Technologies Used
 
@@ -51,18 +60,20 @@ Hasyx takes responsibility for:
 *   Pre-configuring Jest for TypeScript testing of files within the `./lib` directory.
 *   Integrating Resend for sending email verification messages (when `RESEND_API_KEY` is set).
 *   Interactive `npx hasyx cli js [<filePath>] [-e "<script>" | --eval "<script>"]` for quick scripting, data exploration, or debugging interactions with your Hasura backend, with the `client` object available in the global scope.
-*   **Universal Code Execution Engine:** A secure JavaScript execution environment that works in both Node.js and browser contexts, with isolated VM contexts, timeout protection, async/await support, and built-in dynamic npm package loading via use-m. See [`EXEC.md`](EXEC.md) for details.
-*   **TypeScript Execution Engine:** A TypeScript-aware code execution engine that extends the base Exec class with in-memory TypeScript compilation, automatic tsconfig.lib.json loading, and seamless TypeScript syntax detection. Includes `npx hasyx tsx` command for TypeScript execution. See [`EXEC-TS.md`](EXEC-TS.md) for details.
-*   **Terminal Emulation Library:** A comprehensive terminal emulation library for Node.js applications with support for spawning shell processes, executing commands with timeout protection, session management, event handling, and factory functions for different terminal types (bash, zsh, node, python, docker, ssh). Features complete test coverage and cross-platform compatibility using native Node.js APIs. See [`TERMINAL.md`](TERMINAL.md) for details.
-*   **OpenRouter AI Integration with Real-time Streaming:** Complete AI integration with OpenRouter API, supporting multiple AI models (Claude, GPT, Llama, etc.) with built-in code execution capabilities. Features **genuine Server-Sent Events (SSE) streaming** with character-by-character output and real-time progress indicators showing AI thinking, code found, execution status, and results. AI can execute JavaScript/TypeScript code automatically and continue reasoning based on results through iterative processing (up to 3 iterations). Includes both programmatic API and CLI interface with `npx hasyx ask` command. First response tokens appear in 0.5-2 seconds vs 5-10 seconds without streaming. The Ask system uses a modular architecture: **`AskHasyx`** (base class with full AI functionality), **`Ask`** (project-specific extensions), and **`ask.template`** (template for child projects). Similarly, other modules follow this pattern: **`debug.template`**, **`cli.template`**, and **`github-telegram-bot.template`** are copied to child projects during `npx hasyx init`. Execution engines (JavaScript, TypeScript, Terminal) can be configured via `AskOptions` interface. See [`OPENROUTER.md`](OPENROUTER.md) and [`ASK.md`](ASK.md) for details.
+*   **Event-Driven AI Engine:** A modular AI core built around a `Dialog` orchestrator. It supports tool usage and multiple LLM backends through a provider pattern (`Ollama` for local models, `OpenRouter` for cloud models). Interaction is primarily handled via the `npm run ask` command-line interface. See [AI.md](./AI.md) for architecture details.
+*   **Universal Code Execution Engine:** A secure JavaScript/TypeScript execution environment.
+*   **Terminal Emulation Library:** A library for spawning and managing shell processes.
 *   Migrations control with `npx hasyx migrate [filter]` and `npx hasyx unmigrate [filter]` for easy database schema management from `./migrations` directory, with optional filtering to run only specific migrations.
 *   Event triggers with `npx hasyx events` for easy event trigger management from `./events` directory, already configured to NEXT_PUBLIC_MAIN_URL (vercel in most cases) /api/events/[name] routing with security headers.
 *   **Server-side Debug Logging:** Built-in `debug()` method for database logging when `HASYX_DEBUG=1` is enabled, storing structured debug data in a dedicated `debug` table for monitoring and troubleshooting production systems.
 *   **Progressive Web App (PWA) Support:** Complete PWA functionality with service workers, offline support, installability, and push notifications. See [`PWA.md`](PWA.md) for details.
-*   **GitHub → Telegram Bot Integration:** Automated CI/CD notifications via Telegram bot with AI-generated commit summaries, strict status reporting, and privacy-focused messaging. Features strict workflow status reporting (PASSED/FAILED for tests, builds, deploys), privacy-focused messaging (no author names), smart MD file linking, and rich English-language notifications. Waits for all workflows to complete, then sends detailed messages with commit analysis, test results, deployment URLs, and direct links to repository and documentation. Uses a modular architecture: **`github-telegram-bot-hasyx.ts`** (core functionality with generator function), **`github-telegram-bot.ts`** (project-specific configuration), and **`github-telegram-bot.template`** (template for child projects). Configurable via `GITHUB_TELEGRAM_BOT` environment variable. See [`TELEGRAM_BOT.md`](lib/TELEGRAM_BOT.md) for setup and configuration details.
-*   [Coming Soon] Preparing Capacitor for building cross-platform applications (Android, iOS, Desktop, Browser Extensions, etc.).
+*   **Audit Trail & Logs System:** Comprehensive audit trail functionality with configurable database triggers for tracking granular string changes (using diff-match-patch) and complete state snapshots. Features include CLI management with `npx hasyx logs`, JSON-based configuration via `hasyx.config.json`, selective column tracking, and complete Hasura permissions integration. See [`LOGS.md`](LOGS.md) for details.
+*   **GitHub → Telegram Bot Integration:** Automated CI/CD notifications via Telegram bot with AI-generated commit summaries, strict status reporting, and privacy-focused messaging. Features strict workflow status reporting (PASSED/FAILED for tests, builds, deploys), privacy-focused messaging (no author names), smart MD file linking, and rich English-language notifications. Waits for all workflows to complete, then sends detailed messages with commit analysis, test results, deployment URLs, and direct links to repository and documentation. Uses a modular architecture: **`github-telegram-bot-hasyx.ts`** (core functionality with generator function) и **`github-telegram-bot.ts`** (проектная конфигурация). Конфигурируется переменной `HASYX_GITHUB_TELEGRAM_BOT`. См. [`TELEGRAM_BOT.md`](lib/TELEGRAM_BOT.md).
+*   **Capacitor Integration:** Cross-platform application building (Android, iOS, Desktop, Browser Extensions, etc.) with automated build workflows using Fastlane. See [FASTLANE.md](FASTLANE.md) for complete mobile build automation.
 *   **Cytoscape Integration:** A powerful set of React components for graph visualizations using Cytoscape.js, allowing for custom HTML rendering within nodes and reactive style updates. See [`CYTO.md`](CYTO.md) for details.
-*   **DNS and SSL Management:** Comprehensive subdomain management with automated HTTPS setup using CloudFlare DNS, Let's Encrypt SSL certificates, and nginx configuration. Features include DNS propagation waiting, automatic certificate renewal, idempotent operations, and complete subdomain lifecycle management. Use `npx hasyx assist dns` to configure CloudFlare API credentials and domain settings. See [`CLOUDFLARE.md`](CLOUDFLARE.md), [`SSL.md`](SSL.md), [`NGINX.md`](NGINX.md), and [`SUBDOMAIN.md`](SUBDOMAIN.md) for details.
+*   **DNS and SSL Management:** Comprehensive subdomain management with automated HTTPS setup using CloudFlare DNS, Let's Encrypt SSL certificates, and nginx configuration. Features include DNS propagation waiting, automatic certificate renewal, idempotent operations, and complete subdomain lifecycle management. Configure CloudFlare API credentials and domain settings via `hasyx.config.json` (keys: `HASYX_DNS_DOMAIN`, `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ZONE_ID`, `LETSENCRYPT_EMAIL`). See [`CLOUDFLARE.md`](CLOUDFLARE.md), [`SSL.md`](SSL.md), [`NGINX.md`](NGINX.md), and [`SUBDOMAIN.md`](SUBDOMAIN.md) for details.
+*   **URL Query State Management:** A powerful `use-query` hook for synchronizing state between multiple components using URL query parameters. Features automatic URL synchronization, multi-component state sharing, TypeScript support, browser navigation compatibility, SSR safety, and JSON serialization for complex objects. Perfect for search pages, filters, pagination, and any scenario where you need shareable, bookmarkable URLs with persistent state. See [`USE-QUERY.md`](USE-QUERY.md) for complete documentation and examples.
+*   **Docker Hub Publishing:** Automated Docker image building and publishing via GitHub Actions with configurable publishing control. Features multi-architecture support (AMD64/ARM64), optimized Dockerfile with multi-stage builds. Configure `DOCKERHUB_USERNAME`/`DOCKERHUB_PASSWORD` via `hasyx.config.json`. See [`DOCKER.md`](DOCKER.md) for complete documentation and setup instructions.
 
 Applying best development practices from the listed ecosystems, we have combined these libraries into a single framework for rapid deployment.
 
@@ -129,6 +140,10 @@ Applying best development practices from the listed ecosystems, we have combined
 
 Explore the different modules and functionalities of Hasyx:
 
+*   **[AI.md](./AI.md):** High-level overview of the event-driven AI architecture.
+*   **[ASK.md](./ASK.md):** Guide to using the AI command-line interface.
+*   **[OLLAMA.md](./OLLAMA.md):** Instructions for using local models with Ollama.
+*   **[OPENROUTER.md](./OPENROUTER.md):** Instructions for using cloud models with OpenRouter.
 *   **[GENERATOR.md](GENERATOR.md):** Learn about the powerful dynamic query generator for Hasura.
 *   **[CONSTRUCTOR.md](CONSTRUCTOR.md):** Visual GraphQL query builder with real-time results and development roadmap.
 *   **[APOLLO.md](APOLLO.md):** Understand how to use the Apollo Client with Hasyx.
@@ -139,13 +154,15 @@ Explore the different modules and functionalities of Hasyx:
 *   **[EXEC.md](EXEC.md):** Universal JavaScript code execution engine for both Node.js and browser environments.
 *   **[EXEC-TS.md](EXEC-TS.md):** TypeScript execution engine with in-memory compilation and automatic configuration loading.
 *   **[TERMINAL.md](TERMINAL.md):** Comprehensive terminal emulation library for Node.js with process spawning, command execution, session management, and factory functions for different terminal types.
-*   **[OPENROUTER.md](OPENROUTER.md):** AI integration with OpenRouter API and code execution capabilities.
-*   **[ASK.md](ASK.md):** AI assistant command-line interface with real-time streaming for asking questions using OpenRouter with Google Gemini 2.5 Flash Preview model.
 *   **[MARKDOWN-TERMINAL.md](MARKDOWN-TERMINAL.md):** Beautiful markdown formatting for terminal output with colors, syntax highlighting, and proper styling.
 *   **[CYTO.md](CYTO.md):** Guide to Cytoscape.js integration for graph visualizations.
 *   **[HID.md](HID.md):** Explanation of Hasyx Identifiers (HID) for resource identification.
 *   **[EVENTS.md](EVENTS.md):** Complete guide to Hasura Event Triggers integration with automatic synchronization and secure webhook handling.
+*   **[SCHEDULE.md](SCHEDULE.md):** Comprehensive documentation for the Schedule system with cron-based event planning, real-time processing, and database integration.
 *   **[PWA.md](PWA.md):** Progressive Web App support with offline functionality, installability, and push notifications.
+*   **[LOGS.md](LOGS.md):** Comprehensive audit trail system with granular diff tracking and complete state snapshots for your Hasura database.
+*   **[MESSAGING.md](MESSAGING.md):** Messaging schema and permission model (rooms, messages, replies) with streaming subscriptions and read cursors.
+*   **[GROUPS.md](GROUPS.md):** Groups schema and permission model (groups, memberships, invitations) with triggers and allow-lists.
 *   **[NOTIFY.md](NOTIFY.md):** Overview of the notifications system.
 *   **[NOTIFY-FIREBASE.md](NOTIFY-FIREBASE.md):** Specifics on Firebase Cloud Messaging for push notifications.
 *   **[NOTIFY-TELEGRAM-BOT.md](NOTIFY-TELEGRAM-BOT.md):** Details on Telegram Bot integration for notifications.
@@ -156,6 +173,12 @@ Explore the different modules and functionalities of Hasyx:
 *   **[SSL.md](SSL.md):** Documentation for SSL certificate management.
 *   **[NGINX.md](NGINX.md):** Documentation for Nginx configuration.
 *   **[SUBDOMAIN.md](SUBDOMAIN.md):** Documentation for subdomain management.
+*   **[DOCKER.md](DOCKER.md):** Complete Docker containerization guide with automated Hub publishing, multi-architecture builds, and interactive configuration tools.
+*   **[USE-QUERY.md](USE-QUERY.md):** Complete guide to URL query state management with the `use-query` hook for synchronizing state between multiple components through URL parameters.
+*   **[FILES.md](FILES.md):** Complete guide to Hasyx Files Storage system with S3-compatible storage, file upload/download, metadata management, and REST API integration.
+*   **[PLV8.md](PLV8.md):** Complete guide to plv8 (PostgreSQL JavaScript) extension support for creating JavaScript functions and triggers in PostgreSQL with cross-platform compatibility.
+*   **[FASTLANE.md](FASTLANE.md):** Complete guide to Fastlane integration for automated mobile app building, signing, and deployment with CI/CD integration.
+*   **[GEO.md](GEO.md):** PostGIS-powered geospatial layer (schema `geo`, `features` table, spatial helpers, permissions) with Hasyx client usage examples.
 
 ## 🚀 Quick Start
 
@@ -182,8 +205,16 @@ Get your Next.js project integrated with Hasura and authentication in minutes!
     npx hasyx init --reinit
     ```
 
-3.  **Configure Environment Variables:**
-    Create a `.env` file in your project root (or configure environment variables in your deployment platform). Fill in the necessary details for Hasura, NextAuth, and any OAuth providers you plan to use. See the "Environment Variables" section below for a full example and detailed setup instructions.
+3.  **Configure via Hasyx Config (do not edit .env manually):**
+    Run the configurator to edit `hasyx.config.json`. The `.env` and `docker-compose.yml` files are auto-generated and must not be edited by hand.
+    ```bash
+    npx hasyx config
+    # or non-interactive generation:
+    npx hasyx config --silent
+    ```
+    Notes:
+    - The generated `.env` includes a header: “This file is auto-generated by hasyx config. DO NOT EDIT MANUALLY.”
+    - Always change settings through `hasyx.config.json` using `npx hasyx config`.
 
 4.  **Setup Database & Schema:**
     *   Create your database tables and relationships using the Hasura class. You can adapt the example migrations in the `hasyx` package under `migrations/hasyx/` ([up.ts](./migrations/hasyx/up.ts), [down.ts](./migrations/hasyx/down.ts)). Place your migration scripts in a `migrations/<your_migration_name>/` directory in your project root. Use `define*` methods for idempotent operations.
@@ -267,6 +298,16 @@ Get your Next.js project integrated with Hasura and authentication in minutes!
     npx hasyx dev
     ```
 
+8. **Use the AI Assistant:**
+    Start interacting with the AI using the `ask` command.
+    ```bash
+    # Get help on a topic using the default cloud provider
+    npm run ask -- -e "How do I add a new table in Hasura?"
+
+    # Use a local model via Ollama
+    npm run ask -- -e "Write a python script to parse a CSV file" --provider ollama --model codellama:7b
+    ```
+
 ## ⚙️ CLI Commands
 
 Hasyx provides a CLI tool (run via `npx hasyx <command>`) to simplify common tasks:
@@ -331,6 +372,34 @@ You can extend the CLI by modifying your `lib/cli.ts` file to add project-specif
 
 ---
 
+### `config`
+
+Interactive project configuration and silent artifacts generation.
+
+```bash
+# Interactive UI (Ink-based). Edits hasyx.config.json and auto-updates .env and docker-compose.yml on changes
+npx hasyx config
+
+# Silent mode: only generate .env and docker-compose.yml and exit (no UI)
+npx hasyx config --silent
+
+# Equivalent npm script provided in this repo for development
+npm run config
+```
+
+What it does (authoritative source of truth):
+- Reads/writes `hasyx.config.json`
+- Generates `.env` via `lib/config/env.tsx`
+- Generates `docker-compose.yml` via `lib/config/docker-compose.tsx`
+
+Important:
+- `.env` and `docker-compose.yml` are marked as auto-generated. Do not edit them manually.
+- Use `npx hasyx config` to change any environment settings. The tool writes to `hasyx.config.json` and regenerates artifacts.
+
+Tip: Use `--silent` in CI to re-generate artifacts without interactive UI.
+
+---
+
 ### `init`
 
 Initializes Hasyx in your Next.js project. It copies necessary API routes, configuration files, and applies the `next-ws` patch for WebSocket support.
@@ -349,6 +418,8 @@ npx hasyx init --reinit
 
 *   🔄 = Overwrites the file if it exists.
 *   ✨ = Creates the file only if it does not exist (or always replaces it with `--reinit`).
+
+**Note:** Files marked with ✨ are "soft copied" - they won't overwrite existing files unless you use `--reinit` or `--force`. This is particularly useful for files like `public/hasura-schema.json` that you may have already generated and customized in your project.
 
 **npm Scripts Setup:**
 
@@ -370,8 +441,11 @@ During initialization, Hasyx ensures that the following npm scripts are added to
   "schema": "npx hasyx schema",
   "npm-publish": "npm run build && npm publish",
   "cli": "NODE_OPTIONS=\"--experimental-vm-modules\" npx hasyx",
-  "assist": "NODE_OPTIONS=\"--experimental-vm-modules\" npx hasyx assist",
-  "js": "NODE_OPTIONS=\"--experimental-vm-modules\" npx hasyx js"
+  
+  "js": "NODE_OPTIONS=\"--experimental-vm-modules\" npx hasyx js",
+  "logs": "npx hasyx logs",
+  "logs-diffs": "npx hasyx logs-diffs",
+  "logs-states": "npx hasyx logs-states"
 }
 ```
 
@@ -386,9 +460,7 @@ When running `init`, Hasyx automatically patches your Next.js project for WebSoc
 |-- 🔄 CONTRIBUTING.md
 ├── .github/
 │   └── workflows/
-│       ├── 🔄 npm-publish.yml  # Example CI/CD for publishing (if you fork Hasyx)
-│       └── 🔄 test.yml          # Example CI for running tests (if you fork Hasyx)
-│       └── 🔄 nextjs.yml        # Example CI/CD for building and deploying to GitHub Pages (if you fork Hasyx)
+│       └── 🔄 workflow.yml      # Unified CI/CD workflow for tests, builds, deployments, and releases
 ├── app/
 │   ├── ✨ sidebar.ts
 │   ├── ✨ layout.tsx
@@ -398,31 +470,47 @@ When running `init`, Hasyx automatically patches your Next.js project for WebSoc
 │   └── api/
 │       ├── events/
 │       │   ├── [name]/
-│       │   |   └── 🔄 route.ts     # Default event handler for Hasura
+│       │   │   └── 🔄 route.ts     # Default event handler for Hasura
+│       │   ├── subscription-billing/
+│       │   │   └── 🔄 route.ts     # Subscription billing event handler
+│       │   ├── notify/
+│       │   │   └── 🔄 route.ts     # Notification event handler
+│       │   ├── logs-diffs/
+│       │   │   └── 🔄 route.ts     # Logs diff event handler
+│       │   ├── github-issues/
+│       │   │   └── 🔄 route.ts     # GitHub issues event handler for bidirectional sync
 │       │   └── your-custom-event-handler/
 │       │       └── ? route.ts      # Your custom event handlers (copy from [name]/route.ts)
 │       ├── auth/
 │       │   ├── 🔄 route.ts         # Auth API specific logic (if any)
 │       │   ├── [...nextauth]/
-│       │   │   ├── 🔄 route.ts     # NextAuth.js main handler
-│       │   └── verify/
-│       │       └── 🔄 route.ts     # Email verification or similar auth actions
+│       │   │   └── 🔄 route.ts     # NextAuth.js main handler
+│       │   ├── verify/
+│       │   │   └── 🔄 route.ts     # Email verification or similar auth actions
+│       │   ├── verify-telegram-webapp/
+│       │   │   └── 🔄 route.ts     # Telegram WebApp authentication validation
+│       │   └── get-jwt/
+│       │       └── 🔄 route.ts     # JWT token generation endpoint
+│       ├── github/
+│       │   └── issues/
+│       │       └── 🔄 route.ts     # GitHub issues API (GET, POST, PUT, PATCH for webhooks)
 │       ├── graphql/
 │       │   └── 🔄 route.ts         # Hasyx GraphQL Proxy to Hasura
-│       └── telegram_bot/
-│           └── 🔄 route.ts         # Handler for Telegram Bot webhooks
-│       │       └── 🔄 route.ts     # (Likely for email verification)
+│       ├── telegram_bot/
+│       │   └── 🔄 route.ts         # Handler for Telegram Bot webhooks
+│       └── health/
+│           └── 🔄 route.ts         # Health check endpoint
 ├── components/
 │   ├── sidebar/
 │   │   └── ✨ layout.tsx        # Sidebar layout component
-│   └── entities/
-│       └── ✨ default.tsx       # Default entity component
+│   ├── entities/
+│   │   └── ✨ default.tsx       # Default entity component
 ├── lib/
-│   ├── ✨ entities.tsx          # Entity definitions (from entities.template)
-│   ├── ✨ ask.ts               # AI assistant integration (from ask.template)
-│   ├── ✨ debug.ts             # Debug utilities (from debug.template)
-│   ├── ✨ cli.ts               # CLI utilities (from cli.template)
-│   └── ✨ github-telegram-bot.ts # GitHub→Telegram bot integration (from github-telegram-bot.template)
+│   ├── ✨ entities.tsx          # Entity definitions (staged from _lib)
+│   ├── ✨ ask.ts               # AI assistant integration (staged from _lib)
+│   ├── ✨ debug.ts             # Debug utilities (staged from _lib)
+│   ├── ✨ cli.ts               # CLI utilities (staged from _lib)
+│   ├── ✨ github-telegram-bot.ts # GitHub→Telegram bot integration (staged from _lib)
 ├── migrations/
 │   ├── 1746660891582-hasyx-users/
 │   │   ├── ✨ up.ts
@@ -434,6 +522,9 @@ When running `init`, Hasyx automatically patches your Next.js project for WebSoc
 │   │   ├── ✨ up.ts
 │   │   └── ✨ down.ts
 │   ├── 1748511896530-hasyx-payments/
+│   │   ├── ✨ up.ts
+│   │   └── ✨ down.ts
+│   ├── 1746999999999-hasyx-logs/
 │   │   ├── ✨ up.ts
 │   │   └── ✨ down.ts
 │   └── 29991231235959999-hasyx/
@@ -456,20 +547,40 @@ When running `init`, Hasyx automatically patches your Next.js project for WebSoc
 │   │   │   └── ✨ client.tsx    # PWA client component
 │   │   ├── constructor/
 │   │   │   └── ✨ page.tsx      # Visual GraphQL query builder page
+│   │   ├── validation/
+│   │   │   └── ✨ page.tsx      # Form validation testing page
+│   │   ├── files/
+│   │   │   └── ✨ page.tsx      # Files management page
+│   │   ├── messaging/
+│   │   │   └── ✨ page.tsx      # Messaging interface page
+│   │   ├── roadmap/
+│   │   │   ├── ✨ page.tsx      # Development roadmap page
+│   │   │   └── ✨ client.tsx    # Roadmap client component
+│   │   ├── telegram-miniapp/
+│   │   │   └── ✨ page.tsx      # Telegram Mini App page
 │   │   └── doc/
 │   │       ├── ✨ page.tsx      # Documentation index page
 │   │       └── [filename]/
 │   │           └── ✨ page.tsx  # Dynamic documentation page
 |-- public/
 │   ├── ✨ logo.svg             # Default logo, replace with your own
-│   └── ✨ favicon.ico           # Default favicon
+│   ├── ✨ favicon.ico           # Default favicon
+│   └── ✨ hasura-schema.json   # Hasura GraphQL schema (soft copy, won't overwrite existing)
 |-- events/
-│   └── ✨ notify.json           # Default Hasura event trigger definition for notifications
+│   ├── ✨ notify.json           # Default Hasura event trigger definition for notifications
+│   ├── ✨ schedule.json         # Default Hasura event trigger definition for schedule
+│   ├── ✨ schedule-cron.json    # Default Hasura event trigger definition for schedule-cron
+│   ├── ✨ subscription-billing.json # Default Hasura event trigger definition for subscription-billing
+│   ├── ✨ logs-diffs.json       # Default Hasura event trigger definition for logs-diffs
+│   └── ✨ github-issues.json    # GitHub issues event trigger for bidirectional sync
 ├── .vscode/
 │   └── ✨ extensions.json       # Recommended VS Code extensions
-├── ✨ .gitignore               # Git ignore patterns (from .gitignore.template)
-├── ✨ .npmignore               # NPM ignore patterns (from .npmignore.template)
-├── ✨ .npmrc                   # NPM configuration (from .npmrc.template)
+├── ✨ .gitignore               # Git ignore patterns (from _lib/.gitignore)
+├── ✨ .npmignore               # NPM ignore patterns (from _lib/.npmignore)
+├── ✨ .npmrc                   # NPM configuration (from _lib/.npmrc)
+├── ✨ Dockerfile               # Docker container configuration
+├── ✨ Dockerfile.postgres      # PostgreSQL Docker container with PLV8 and PostGIS
+├── ✨ .dockerignore            # Docker ignore patterns
 ├── ✨ vercel.json              # Vercel deployment configuration
 ├── ✨ babel.jest.config.mjs    # Babel configuration for Jest
 ├── ✨ jest.config.mjs          # Jest testing configuration
@@ -620,6 +731,107 @@ The CLI automatically loads environment variables from the `.env` file in your p
 
 ---
 
+ 
+
+**Interactive Project Configuration Assistant**
+
+Interactive assistant to set up and configure your Hasyx project with step-by-step prompts for all major components.
+
+```bash
+# Run the full assistant (recommended for new projects)
+npx hasyx
+
+# Skip specific steps
+
+```
+
+**🎯 Available Configuration Options:**
+
+**Authentication & Security:**
+- `--skip-auth` - Skip GitHub authentication check
+- `--skip-secrets` - Skip authentication secrets setup
+- `--skip-oauth` - Skip OAuth configuration
+
+**Project Setup:**
+- `--skip-repo` - Skip repository setup
+- `--skip-env` - Skip environment setup
+- `--skip-package` - Skip package.json setup
+- `--skip-init` - Skip hasyx initialization
+
+**Database & Backend:**
+- `--skip-hasura` - Skip Hasura configuration
+- `--skip-pg` - Skip PostgreSQL configuration
+- `--skip-migrations` - Skip migrations check
+
+**External Services:**
+- `--skip-resend` - Skip Resend configuration
+- `--skip-firebase` - Skip Firebase configuration
+- `--skip-telegram` - Skip Telegram Bot configuration
+- `--skip-openrouter` - Skip OpenRouter API Key setup
+- `--skip-github` - Skip GitHub Token setup
+- `--skip-github-webhooks` - Skip GitHub webhooks configuration
+
+**Infrastructure:**
+- `--skip-dns` - Skip DNS configuration
+- `--skip-docker` - Skip Docker configuration
+- `--skip-storage` - Skip Storage configuration
+- `--skip-vercel` - Skip Vercel setup
+
+**Development:**
+- `--skip-sync` - Skip environment variable sync
+- `--skip-commit` - Skip commit step
+- `--skip-project-user` - Skip setting up project user
+
+**✨ Assistant Features:**
+
+**Interactive Configuration:**
+- Step-by-step setup with clear prompts
+- Automatic environment variable management
+- Base URL detection for OAuth callbacks
+- Repository validation and formatting
+
+**GitHub Integration:**
+- GitHub OAuth app configuration
+- Webhook setup for issues synchronization
+- Automatic secret generation
+- Repository owner/repo name parsing
+
+**Storage Configuration:**
+- Local MinIO setup
+- Cloud storage providers (AWS S3, GCP, Azure, DigitalOcean, Cloudflare R2)
+- Antivirus scanning (ClamAV)
+- Image manipulation and optimization
+
+**Documentation Generation:**
+- Creates detailed setup instructions
+- Generates configuration files
+- Provides troubleshooting guides
+- Updates environment variables
+
+**Example Workflows:**
+
+**New Project Setup:**
+```bash
+# Complete setup for a new project
+npx hasyx
+```
+
+**GitHub Webhooks Only:**
+```bash
+# Configure only GitHub webhooks
+
+```
+
+**Storage Configuration Only:**
+```bash
+# Configure only storage
+
+```
+
+**📖 See [GITHUB-WEBHOOKS.md](GITHUB-WEBHOOKS.md) for detailed webhook setup instructions.**
+
+---
+
 ### `subdomain` 🌐
 
 **Complete Subdomain Management with DNS, SSL, and Nginx**
@@ -657,7 +869,7 @@ The following environment variables are required:
 
 Configure these variables using:
 ```bash
-npx hasyx assist
+npx hasyx
 ```
 
 **✨ Features:**
@@ -712,11 +924,11 @@ npm run ask -- -e "What is the capital of France?"
 - `-h, --help` - Show help information
 
 **🎯 Real-time Progress Features:**
-- **🧠 AI думает...** - When AI is generating responses
-- **💭 AI ответил (N символов)** - Response received with character count
-- **📋 Найден JS/TSX код для выполнения** - Code found for execution
-- **⚡ Выполняется JS/TSX код...** - Code execution in progress
-- **✅ Результат выполнения** - Execution results displayed
+- **🧠 AI is thinking...** - When AI is generating responses
+- **💭 AI responded (N characters)** - Response received with character count
+- **📋 Found JS/TSX code to execute** - Code found for execution
+- **⚡ Executing JS/TSX code...** - Code execution in progress
+- **✅ Execution result** - Execution results displayed
 
 **🔄 Automatic Code Execution:**
 - AI can execute JavaScript and TypeScript code automatically
@@ -728,18 +940,18 @@ npm run ask -- -e "What is the capital of France?"
 ```bash
 $ npx hasyx ask -e "Check process.platform"
 
-🧠 AI думает...
-💭 AI ответил (156 символов)
-📋 Найден JS код для выполнения:
+🧠 AI is thinking...
+💭 AI responded (156 characters)
+📋 Found JS code to execute:
 ```js
 process.platform
 ```
-⚡ Выполняется JS код...
-✅ Результат выполнения:
+⚡ Executing JS code...
+✅ Execution result:
 darwin
 
-🧠 AI думает...
-💭 AI ответил (298 символов)
+🧠 AI is thinking...
+💭 AI responded (298 characters)
 
 You're running on macOS (darwin platform)...
 ```

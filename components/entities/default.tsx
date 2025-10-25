@@ -4,24 +4,16 @@ import React from 'react';
 import { Button as UIButton } from 'hasyx/components/ui/button';
 import { Card as UICard, CardContent, CardHeader, CardTitle } from 'hasyx/components/ui/card';
 import { Badge } from 'hasyx/components/ui/badge';
+import { CytoNode as CytoNodeComponent } from 'hasyx/lib/cyto';
 import { X, Database } from 'lucide-react';
+import { useTranslations } from 'hasyx';
+import { cn } from 'hasyx/lib/utils';
 
-interface DefaultEntityData {
-  id?: string;
+interface DefaultData {
+  id: string;
   created_at?: string;
   updated_at?: string;
   __typename?: string;
-  [key: string]: any;
-}
-
-interface DefaultButtonProps {
-  data: DefaultEntityData | string;
-  [key: string]: any;
-}
-
-interface DefaultCardProps {
-  data: DefaultEntityData | string;
-  onClose?: () => void;
   [key: string]: any;
 }
 
@@ -40,7 +32,11 @@ function getEntityTypeFromTypename(typename?: string): { table: string; schema: 
   return { table, schema };
 }
 
-export function Button({ data, ...props }: DefaultButtonProps) {
+export function Button({ data, ...props }: {
+  data: DefaultData;
+  [key: string]: any;
+}) {
+  const t = useTranslations('entities.default');
   const entityId = typeof data === 'string' ? data : data?.id;
   const entityData = typeof data === 'object' ? data : null;
   
@@ -64,7 +60,12 @@ export function Button({ data, ...props }: DefaultButtonProps) {
   );
 }
 
-export function Card({ data, onClose, ...props }: DefaultCardProps) {
+export function Card({ data, onClose, ...props }: {
+  data: DefaultData;
+  onClose?: () => void;
+  [key: string]: any;
+}) {
+  const t = useTranslations('entities.default');
   const entityId = typeof data === 'string' ? data : data?.id;
   const entityData = typeof data === 'object' ? data : null;
   
@@ -73,9 +74,9 @@ export function Card({ data, onClose, ...props }: DefaultCardProps) {
       <UICard className="w-80" {...props}>
         <CardContent className="p-4">
           <div className="text-sm text-muted-foreground">
-            Entity ID: {data}
+            {t('entityId')}: {data}
             <br />
-            <span className="text-xs">No additional data available</span>
+            <span className="text-xs">{t('noAdditional')}</span>
           </div>
         </CardContent>
       </UICard>
@@ -101,7 +102,7 @@ export function Card({ data, onClose, ...props }: DefaultCardProps) {
             <div>
               <CardTitle className="text-base capitalize">{table}</CardTitle>
               {schema !== 'public' && (
-                <p className="text-sm text-muted-foreground">Schema: {schema}</p>
+                <p className="text-sm text-muted-foreground">{t('schema')}: {schema}</p>
               )}
             </div>
           </div>
@@ -132,19 +133,19 @@ export function Card({ data, onClose, ...props }: DefaultCardProps) {
           {/* Timestamps */}
           {entityData?.created_at && (
             <div className="text-xs text-muted-foreground">
-              Created: {new Date(entityData.created_at).toLocaleDateString()}
+              {t('created')}: {new Date(entityData.created_at).toLocaleDateString()}
             </div>
           )}
           {entityData?.updated_at && (
             <div className="text-xs text-muted-foreground">
-              Updated: {new Date(entityData.updated_at).toLocaleDateString()}
+              {t('updated')}: {new Date(entityData.updated_at).toLocaleDateString()}
             </div>
           )}
           
           {/* User data as JSON if present */}
           {Object.keys(userData).length > 0 && (
             <div className="mt-3">
-              <div className="text-xs font-medium mb-1">Data:</div>
+              <div className="text-xs font-medium mb-1">{t('data')}:</div>
               <div className="bg-muted rounded p-2 text-xs font-mono overflow-auto max-h-32">
                 <pre>{JSON.stringify(userData, null, 2)}</pre>
               </div>
@@ -154,4 +155,19 @@ export function Card({ data, onClose, ...props }: DefaultCardProps) {
       </CardContent>
     </UICard>
   );
-} 
+}
+
+export function CytoNode({ data, ...props }: {
+  data: DefaultData;
+  [key: string]: any;
+}) {
+  return <CytoNodeComponent {...props} element={{
+    id: data.id,
+    data: {
+      id: data.id,
+      label: data?.name,
+    },
+    ...props?.element,
+    classes: cn('entity', props.classes)
+  }} />;
+}

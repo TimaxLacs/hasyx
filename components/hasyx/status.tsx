@@ -1,6 +1,7 @@
 'use client';
 
 import { Button } from "hasyx/components/ui/button"
+import { useTranslations } from 'hasyx';
 import { Check, Loader2, X } from "lucide-react"
 
 type StatusProps = {
@@ -11,9 +12,10 @@ type StatusProps = {
 
 export function Status({ status = 'connecting', label, error }: StatusProps) {
   // Display custom label if provided, otherwise use default text
-  const connectingText = label || 'Connecting';
-  const connectedText = label || 'Connected';
-  const errorText = label || 'Error';
+  const t = useTranslations();
+  const connectingText = label || t('common.loading');
+  const connectedText = label || t('common.yes');
+  const errorText = label || t('common.error');
   const idleText = label || 'Idle';
   return (<>
 

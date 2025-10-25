@@ -1,6 +1,7 @@
 import { SignJWT, jwtVerify, jwtDecrypt, type JWTPayload } from 'jose';
 import Debug from './debug';
 import jwt from 'jsonwebtoken';
+// IMPORTANT: Do not import Hasyx, apollo, or invite here to avoid circular deps in middleware
 // crypto.subtle is globally available in Node >= 15, browsers, and edge runtimes.
 // No explicit import needed for it, but Node's 'crypto' might be needed for other things if used elsewhere.
 // import crypto from 'crypto'; // We don't need the Node-specific module anymore for hashing.
@@ -117,12 +118,59 @@ export const generateJWT = async (
     }
     
     // Create the Hasura claims
-    const hasuraClaims = {
+    let hasuraClaims = {
       'x-hasura-allowed-roles': ['user', 'anonymous', 'me'],
       'x-hasura-default-role': 'user',
       'x-hasura-user-id': userId,
       ...additionalClaims
     };
+
+    // Check if only invited users should get user role
+    const onlyInvitedUser = process.env.NEXT_PUBLIC_HASYX_ONLY_INVITE_USER === '1';
+    if (onlyInvitedUser) {
+      debug(`🔒 Only invited users mode enabled`);
+      
+      try {
+        // Perform a real check using direct GraphQL call with admin secret to avoid import cycles
+        const adminSecret = process.env.HASURA_ADMIN_SECRET;
+        const hasuraUrl = process.env.NEXT_PUBLIC_HASURA_GRAPHQL_URL;
+        if (!adminSecret || !hasuraUrl) {
+          debug('Missing HASURA_ADMIN_SECRET or NEXT_PUBLIC_HASURA_GRAPHQL_URL; skipping invite check');
+          throw new Error('Missing HASURA envs');
+        }
+        const query = `query IsInvited($userId: uuid!) { invited(where: { user_id: { _eq: $userId } }, limit: 1) { id } }`;
+        const res = await fetch(hasuraUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-hasura-admin-secret': adminSecret,
+          },
+          body: JSON.stringify({ query, variables: { userId } }),
+        });
+        const json: any = await res.json();
+        if (json?.errors) {
+          throw new Error(JSON.stringify(json.errors));
+        }
+        const isInvited = Array.isArray(json?.data?.invited) && json.data.invited.length > 0;
+        debug(`🎫 User invited status: ${isInvited}`);
+        
+        if (!isInvited && hasuraClaims['x-hasura-allowed-roles']?.includes('user')) {
+          debug(`⚠️ Removing user role from non-invited user`);
+          // Remove 'user' role from allowed roles
+          hasuraClaims['x-hasura-allowed-roles'] = hasuraClaims['x-hasura-allowed-roles'].filter((role: string) => role !== 'user');
+          
+          // If default role was 'user', change it to 'anonymous'
+          if (hasuraClaims['x-hasura-default-role'] === 'user') {
+            hasuraClaims['x-hasura-default-role'] = 'anonymous';
+          }
+          
+          debug(`🏷️ Updated Hasura Claims:`, hasuraClaims);
+        }
+      } catch (error) {
+        debug(`⚠️ Error checking invite status, keeping original claims:`, error);
+      }
+    }
+
     debug(`🏷️ Final Hasura claims:`, hasuraClaims);
     
     // Create the payload

@@ -2,7 +2,11 @@ import Debug from './debug';
 
 const debug = Debug('url');
 
-export const API_URL = process.env.NEXT_PUBLIC_API_URL || process.env.NEXT_PUBLIC_MAIN_URL || process.env.NEXT_PUBLIC_BASE_URL || 'localhost:3000';
+export const API_URL =
+  process.env.NEXT_PUBLIC_API_URL ||
+  process.env.NEXT_PUBLIC_BASE_URL ||
+  process.env.NEXT_PUBLIC_MAIN_URL ||
+  '';
 
 // Testing field for environment simulation in tests
 declare global {
@@ -139,7 +143,12 @@ function determineSecureProtocol(host: string, protocol: string): boolean {
     debug(`Client secure location: ${isSecureLocation}`);
     return isSecureLocation;
   } else {
-    // Server: always assume secure
+    // Server: do NOT force https for localhost
+    const isLocalhost = /^(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/.test(host);
+    if (isLocalhost) {
+      debug('Server environment + localhost detected - not forcing secure protocol');
+      return false;
+    }
     debug('Server environment - using secure protocol');
     return true;
   }
@@ -161,3 +170,10 @@ function makeSecureProtocol(protocol: string): string {
 
 // Attach testing field
 (url as any)._isClient = undefined;
+
+// Simple helper signature used in many places: url('/path') -> base/path
+export function urlPath(pathname: string = ''): string {
+  const base = API_URL.replace(/\/$/, '');
+  const p = String(pathname || '').replace(/^\//, '');
+  return p ? `${base}/${p}` : base;
+}

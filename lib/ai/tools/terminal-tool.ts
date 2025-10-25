@@ -1,0 +1,76 @@
+import { Tool, ToolResult } from '../tool';
+import { terminalDo } from '../../../lib/terminal';
+import { ExecResult as InternalExecResult } from '../../../lib/exec';
+import Debug from '../../debug';
+
+const debug = Debug('hasyx:terminal-tool');
+
+const contextPreprompt = `📦 **Terminal Execution Environment (terminal)**
+
+Execute shell commands in terminal.
+
+Format: > 😈<uuid>/terminal/exec
+Example: > 😈ls-123/terminal/exec`;
+
+export class TerminalTool extends Tool {
+  private timeout: number;
+
+  constructor(options: { timeout?: number } = {}) {
+    super({
+      name: 'terminal',
+      contextPreprompt: contextPreprompt
+    });
+    this.timeout = options.timeout !== undefined ? options.timeout : 30000; // 30 seconds default, 0 = no timeout
+    debug('TerminalTool initialized with timeout: %d ms', this.timeout);
+  }
+
+  async execute(command: string, content: string, tooler: any): Promise<ToolResult> {
+    if (command.trim() !== 'exec') {
+      throw new Error(`Unknown command for TerminalTool: ${command}`);
+    }
+
+    debug('Executing terminal command with timeout %d: %s', this.timeout, content);
+
+    try {
+      debug('Creating terminal instance...');
+      // Create terminal with configured timeout
+      const terminal = new (await import('../../../lib/terminal')).Terminal({ 
+        commandTimeout: this.timeout,
+        autoStart: false 
+      });
+      
+      debug('Terminal instance created, starting...');
+      
+      let result: string;
+      try {
+        await terminal.start();
+        debug('Terminal started successfully, executing command...');
+        result = await terminal.execute(content);
+        debug('Command executed successfully');
+      } finally {
+        debug('Destroying terminal instance...');
+        terminal.destroy();
+        debug('Terminal instance destroyed');
+      }
+
+      debug('Terminal command successful, result length: %d', result.length);
+      
+      return {
+        id: 'not_used',
+        result: result
+      };
+
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      debug('Terminal command failed: %s', errorMessage);
+      debug('Error object: %o', error);
+      
+      // Return error as result instead of null, so AI can see what went wrong
+      return {
+        id: 'not_used',
+        result: `Command failed: ${errorMessage}`,
+        error: errorMessage
+      };
+    }
+  }
+} 

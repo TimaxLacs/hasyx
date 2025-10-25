@@ -11,11 +11,13 @@ import {
   DropdownMenuTrigger,
 } from "hasyx/components/ui/dropdown-menu";
 import { Avatar, AvatarFallback, AvatarImage } from "hasyx/components/ui/avatar";
-import { LogOut, LogIn, User, Settings, Github, Mail, MailCheck } from "lucide-react";
+import { LogOut, LogIn, User, Settings, Github, Mail, MailCheck, Trash2, EyeOff } from "lucide-react";
 import { signOut, signIn } from "next-auth/react";
-import { useClient, useSession } from 'hasyx';
+import { useHasyx, useNewHasyx, useSession } from 'hasyx';
 import { useSubscription } from 'hasyx';
+import { Accounts } from '../hasyx/users/accounts';
 import { OAuthButtons } from '../auth/oauth-buttons';
+import { useTranslations } from 'hasyx';
 
 function getInitials(name: string | null | undefined): string {
   if (!name) return "U";
@@ -76,77 +78,79 @@ function getProviderIcon(provider: string) {
   }
 }
 
-function UserAccountsList({ userId }: { userId: string }) {
-  const { data: accounts, loading } = useSubscription(
-    {
-      table: 'accounts',
-      where: { user_id: { _eq: userId } },
-      returning: ['id', 'provider'],
-    },
+// Custom component for dropdown menu account display
+function DropdownAccountItem({ account, delete: handleDelete, _delete }: any) {
+  return (
+    <DropdownMenuItem 
+      className="flex items-center justify-between gap-3 cursor-default px-2 py-1.5"
+      onClick={(e) => e.preventDefault()}
+    >
+      <div className="flex items-center gap-2">
+        {getProviderIcon(account.provider)}
+        <span className="text-sm font-medium capitalize">{account.provider}</span>
+      </div>
+      <button 
+        onClick={(e) => {
+          e.stopPropagation();
+          handleDelete(account);
+        }}
+        className="text-xs text-muted-foreground hover:text-destructive"
+        title={useTranslations()('tooltips.deleteAccountConnection')}
+      >
+        <Trash2 size={14} />
+      </button>
+    </DropdownMenuItem>
   );
+}
 
-  if (loading) {
-    return <div className="text-sm text-muted-foreground px-2 py-1">Loading accounts...</div>;
-  }
-
-  if (accounts.length === 0) {
-    return <div className="text-sm text-muted-foreground px-2 py-1">No connected accounts</div>;
-  }
-
+function UserAccountsList({ userId }: { userId: string }) {
+  const t = useTranslations();
   return (
     <div className="space-y-1">
-      <DropdownMenuLabel className="text-xs text-muted-foreground">Connected Accounts</DropdownMenuLabel>
-      {accounts.map((account) => (
-        <DropdownMenuItem key={account.id} className="flex items-center gap-3 cursor-default">
-          {getProviderIcon(account.provider)}
-          <div className="flex flex-col flex-1">
-            <span className="text-sm font-medium capitalize">{account.provider}</span>
-          </div>
-        </DropdownMenuItem>
-      ))}
+      <DropdownMenuLabel className="text-xs text-muted-foreground">{t('connectedAccounts')}</DropdownMenuLabel>
+      <Accounts userId={userId} AccountComponent={DropdownAccountItem} />
     </div>
   );
 }
 
-function AuthenticatedUserMenu({ session }: { session: any }) {
+// function AuthenticatedUserMenu({ session }: { session: any }) {
+function AuthenticatedUserMenu({}: {}) {
+  const hasyx = useHasyx();
+  const t = useTranslations();
   const handleSignOut = async () => {
-    await signOut({ callbackUrl: '/' });
+    hasyx.logout({ callbackUrl: '/' });
   };
 
   return (
     <>
       <DropdownMenuLabel className="font-normal">
         <div className="flex flex-col space-y-1">
-          <p className="text-sm font-medium leading-none">{session.user?.name || 'User'}</p>
+          <p className="text-sm font-medium leading-none">{hasyx.user?.name || 'User'}</p>
           <div className="flex items-center gap-1">
             <p className="text-xs leading-none text-muted-foreground">
-              {session.user?.email}
+              {hasyx.user?.email}
             </p>
-            {session.hasuraClaims?.['x-hasura-user-id'] && (
-              <div className="ml-1">
-                {/* Email verification status will be shown via subscription in accounts list */}
-              </div>
-            )}
           </div>
         </div>
       </DropdownMenuLabel>
       <DropdownMenuSeparator />
       
-      {session.user?.id && <UserAccountsList userId={session.user.id} />}
+      {hasyx.userId && <UserAccountsList userId={hasyx.userId} />}
       
       <DropdownMenuSeparator />
       <DropdownMenuItem onClick={handleSignOut} className="text-red-600 focus:text-red-600">
         <LogOut className="mr-2 h-4 w-4" />
-        Sign out
+        {t('signOut')}
       </DropdownMenuItem>
     </>
   );
 }
 
 function UnauthenticatedUserMenu() {
+  const t = useTranslations();
   return (
     <>
-      <DropdownMenuLabel>Sign in to your account</DropdownMenuLabel>
+      <DropdownMenuLabel>{t('auth.signInToYourAccount')}</DropdownMenuLabel>
       <DropdownMenuSeparator />
       <div className="p-2">
         <OAuthButtons />
@@ -156,36 +160,72 @@ function UnauthenticatedUserMenu() {
 }
 
 export function UserProfileDropdown() {
-  const { data: session, status } = useSession();
+  const hasyx = useHasyx();
   const [open, setOpen] = useState(false);
+  const t = useTranslations();
 
-  const isLoading = status === 'loading';
-  const isAuthenticated = status === 'authenticated' && session?.user;
+  const isAuthenticated = hasyx?.userId;
+  const isLoading = false;
+
+  const [canReturn, setCanReturn] = useState(false);
+  const [backTo, setBackTo] = useState<string | null>(null);
+  React.useEffect(() => {
+    try {
+      const saved = localStorage.getItem('hasyx_impersonator_info');
+      if (saved) {
+        const info = JSON.parse(saved || '{}');
+        setBackTo(info?.name || info?.id || null);
+        setCanReturn(true);
+      } else {
+        setBackTo(null);
+        setCanReturn(false);
+      }
+    } catch {
+      setBackTo(null);
+      setCanReturn(false);
+    }
+  }, [open, hasyx?.userId]);
+
+  const handleStopImpersonation = () => {
+    (hasyx as any).stopImpersonation?.();
+    setCanReturn(false);
+    setBackTo(null);
+  };
 
   return (
     <DropdownMenu open={open} onOpenChange={setOpen}>
       <DropdownMenuTrigger asChild>
-        <Button variant="ghost" className="relative h-8 w-auto rounded-full px-3" disabled={isLoading}>
+        <Button variant="ghost" className="relative h-8 w-auto rounded-full px-2 sm:px-3 flex items-center gap-2" disabled={isLoading}>
+          {canReturn && (
+            <button
+              onClick={(e) => { e.stopPropagation(); handleStopImpersonation(); }}
+              className="flex items-center gap-1 text-xs px-2 py-1 rounded bg-muted hover:bg-muted/70"
+              title={backTo ? `Вернуться под ${backTo}` : 'Перестать смотреть его глазами'}
+            >
+              <EyeOff className="h-4 w-4" />
+              <span className="hidden sm:inline">{backTo ? backTo : ''}</span>
+            </button>
+          )}
           {isLoading ? (
             <div className="flex items-center gap-2">
-              <span className="text-sm font-medium">Loading...</span>
+              <span className="text-sm font-medium">{useTranslations()('common.loading')}</span>
               <div className="h-6 w-6 rounded-full bg-muted animate-pulse" />
             </div>
           ) : isAuthenticated ? (
             <div className="flex items-center gap-2">
               <span className="text-sm font-medium hidden sm:inline-block">
-                {session.user?.name || 'User'}
+                {hasyx?.user?.name || 'User'}
               </span>
               <Avatar className="h-6 w-6">
-                <AvatarImage src={session.user?.image || undefined} alt={session.user?.name || 'User'} />
+                <AvatarImage src={hasyx?.user?.image || undefined} alt={hasyx?.user?.name || 'User'} />
                 <AvatarFallback className="text-xs">
-                  {getInitials(session.user?.name)}
+                  {getInitials(hasyx?.user?.name)}
                 </AvatarFallback>
               </Avatar>
             </div>
           ) : (
             <div className="flex items-center gap-2">
-              <span className="text-sm font-medium">Sign in</span>
+              <span className="text-sm font-medium">{t('auth.signIn')}</span>
               <LogIn className="h-4 w-4" />
             </div>
           )}
@@ -193,7 +233,7 @@ export function UserProfileDropdown() {
       </DropdownMenuTrigger>
       <DropdownMenuContent className="w-64" align="end">
         {isAuthenticated ? (
-          <AuthenticatedUserMenu session={session} />
+          <AuthenticatedUserMenu />
         ) : (
           <UnauthenticatedUserMenu />
         )}

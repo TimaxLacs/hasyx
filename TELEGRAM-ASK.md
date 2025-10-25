@@ -44,15 +44,13 @@ Telegram Bot API → User
 
 ## Quick Start
 
-### 1. Environment Setup
+### 1. Environment Setup (via configurator)
 
-```env
-# Required environment variables
-TELEGRAM_BOT_TOKEN="your_telegram_bot_token"
-OPENROUTER_API_KEY="your_openrouter_api_key"
-NEXT_PUBLIC_HASURA_GRAPHQL_URL="your_hasura_url"
-HASURA_ADMIN_SECRET="your_hasura_secret"
-```
+Переменные окружения настраиваются через `npx hasyx config`. Файл `.env` автогенерируется и не должен редактироваться вручную. Убедитесь, что заданы:
+- `TELEGRAM_BOT_TOKEN`
+- `OPENROUTER_API_KEY`
+- `NEXT_PUBLIC_HASURA_GRAPHQL_URL`
+- `HASURA_ADMIN_SECRET`
 
 ### 2. Basic Integration in route.ts
 
@@ -173,7 +171,7 @@ const askInstance = defineTelegramAsk(
 );
 ```
 
-### Custom Output Handlers
+### Manual AskHasyx Creation with Custom Handlers
 
 ```typescript
 import { AskHasyx, OutputHandlers } from 'hasyx/lib/ask-hasyx';
@@ -193,29 +191,12 @@ const customHandlers: OutputHandlers = {
 
 const askInstance = new AskHasyx(
   openRouterToken,
-  {}, // context
-  {}, // options  
-  'Custom system prompt',
-  { exec: true, execTs: true, terminal: true },
-  customHandlers
+  {
+    systemPrompt: 'Custom system prompt',
+    askOptions: { exec: true, execTs: true, terminal: true },
+    outputHandlers: customHandlers
+  }
 );
-```
-
-### wrapTelegramAsk()
-
-Альтернативный способ создания Telegram-совместимого класса:
-
-```typescript
-import { Ask } from 'hasyx/lib/ask';
-import { wrapTelegramAsk } from 'hasyx/lib/ask-telegram';
-
-// Создать Telegram-версию любого Ask класса
-const TelegramAsk = wrapTelegramAsk(Ask, chatId, botToken, {
-  bufferTime: 1000,
-  enableCodeBlocks: true
-});
-
-const askInstance = new TelegramAsk(openRouterToken, 'My Project');
 ```
 
 ## Error Handling
@@ -363,190 +344,3 @@ export const Button: React.FC<ButtonProps> = ({
 
 This component accepts children, click handler, and optional variant.
 ```
-
-### Terminal Command Bot
-
-```typescript
-// User: "Show current directory contents"
-🧠 AI думает...
-📋 Найден TERMINAL код для выполнения:
-ls -la
-⚡ Выполняется TERMINAL код...
-✅ Результат выполнения:
-total 48
-drwxr-xr-x  8 user  staff   256 Dec 15 10:30 .
-drwxr-xr-x  4 user  staff   128 Dec 15 10:25 ..
--rw-r--r--  1 user  staff  1234 Dec 15 10:30 file.txt
-
-Here are the contents of your current directory...
-```
-
-## Security Considerations
-
-### API Key Management
-
-```typescript
-// ✅ Good: Use environment variables
-const openRouterToken = process.env.OPENROUTER_API_KEY;
-
-// ❌ Bad: Hardcode in source
-const openRouterToken = 'sk-or-v1-hardcoded-key';
-```
-
-### User Isolation
-
-- Каждый пользователь получает отдельный экземпляр AI
-- Memory и результаты изолированы между пользователями
-- Автоматическая очистка предотвращает утечки данных
-
-### Rate Limiting
-
-```typescript
-// Implement user-level rate limiting
-const userLimits = new Map<number, { count: number; resetTime: number }>();
-
-function checkRateLimit(userId: number): boolean {
-  const limit = userLimits.get(userId);
-  const now = Date.now();
-  
-  if (!limit || now > limit.resetTime) {
-    userLimits.set(userId, { count: 1, resetTime: now + 60000 });
-    return true;
-  }
-  
-  if (limit.count >= 10) { // 10 requests per minute
-    return false;
-  }
-  
-  limit.count++;
-  return true;
-}
-```
-
-## Troubleshooting
-
-### Common Issues
-
-**1. "TELEGRAM_BOT_TOKEN is not set"**
-```bash
-# Check environment variables
-echo $TELEGRAM_BOT_TOKEN
-# Add to .env file
-TELEGRAM_BOT_TOKEN="your_token_here"
-```
-
-**2. "OpenRouter API Key not configured"**
-```bash
-# Check environment variables  
-echo $OPENROUTER_API_KEY
-# Get free key from openrouter.ai
-```
-
-**3. Messages not sending**
-```typescript
-// Check bot token and permissions
-const botInfo = await fetch(`https://api.telegram.org/bot${token}/getMe`)
-  .then(r => r.json());
-console.log('Bot info:', botInfo);
-```
-
-**4. High memory usage**
-```typescript
-// Monitor instance count
-setInterval(() => {
-  const stats = getTelegramAskStats();
-  console.log(`Active instances: ${stats.totalInstances}`);
-  if (stats.totalInstances > 100) {
-    console.warn('High instance count detected');
-  }
-}, 60000);
-```
-
-### Debug Mode
-
-```bash
-# Enable comprehensive debugging
-DEBUG="hasyx:*" npm start
-```
-
-## Migration Guide
-
-### From Basic Telegram Bot
-
-**Before:**
-```typescript
-await sendTelegramMessage(botToken, chatId, `Echo: ${userMessage}`);
-```
-
-**After:**
-```typescript
-const askInstance = defineTelegramAsk(userId, chatId, botToken, openRouterToken);
-await askInstance.ask(userMessage);
-```
-
-### From Console Ask
-
-**Before:**
-```typescript
-import { ask } from 'hasyx/lib/ask';
-const response = await ask.ask('What is 2+2?');
-console.log(response);
-```
-
-**After:**
-```typescript
-import { defineTelegramAsk } from 'hasyx/lib/ask-telegram';
-const askInstance = defineTelegramAsk(userId, chatId, botToken, openRouterToken);
-// Response automatically sent to Telegram
-await askInstance.ask('What is 2+2?');
-```
-
-## Best Practices
-
-### 1. Instance Management
-- Используйте `defineTelegramAsk()` для автоматического управления экземплярами
-- Не создавайте экземпляры вручную для каждого запроса
-- Мониторьте количество активных экземпляров
-
-### 2. Error Handling
-- Всегда оборачивайте AI calls в try-catch
-- Предоставляйте понятные сообщения об ошибках пользователям
-- Логируйте ошибки для мониторинга
-
-### 3. Performance
-- Используйте message buffering для оптимизации
-- Настройте разумные timeouts
-- Ограничивайте rate limits пользователей
-
-### 4. Security
-- Никогда не передавайте API ключи в сообщениях
-- Изолируйте пользователей друг от друга
-- Реализуйте rate limiting и abuse protection
-
-## Related Documentation
-
-- **[ASK.md](ASK.md)**: Базовая документация Ask системы
-- **[AI.md](AI.md)**: Core AI functionality и streaming
-- **[TELEGRAM-BOT.md](TELEGRAM-BOT.md)**: Basic Telegram bot integration
-- **[OPENROUTER.md](OPENROUTER.md)**: OpenRouter API integration
-
-## Contributing
-
-Для улучшения Telegram Ask integration:
-
-1. Fork repository
-2. Создайте feature branch
-3. Добавьте тесты для новой функциональности
-4. Обновите документацию
-5. Submit pull request
-
-## Roadmap
-
-### Planned Features
-
-- **Group Chat Support**: Работа в групповых чатах
-- **Inline Keyboards**: Интерактивные кнопки и меню
-- **File Upload**: Обработка файлов и изображений  
-- **Voice Messages**: Поддержка голосовых сообщений
-- **Webhook Management**: Автоматическая настройка webhook
-- **Analytics**: Детальная аналитика использования 

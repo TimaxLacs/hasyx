@@ -1,52 +1,76 @@
 #!/usr/bin/env node
 
-import { newGithubTelegramBot } from 'hasyx/lib/github-telegram-bot-hasyx';
+import * as dotenv from 'dotenv';
+import * as path from 'path';
+import * as fs from 'fs';
+import { newGithubTelegramBot } from 'hasyx/lib/github/github-telegram-bot-hasyx';
+
+// Load environment variables from .env file in the consumer project
+dotenv.config({ path: path.resolve(process.cwd(), '.env') });
+
+// Load package.json from the consumer project
+const pckgPath = path.resolve(process.cwd(), 'package.json');
+const pckg = fs.existsSync(pckgPath) ? JSON.parse(fs.readFileSync(pckgPath, 'utf-8')) : {};
+
+// Helper to get Telegram channel ID for GitHub notifications
+function getTelegramChannelId(): string | undefined {
+  return process.env.TELEGRAM_CHANNEL_ID;
+}
 
 // Configure GitHub Telegram Bot with the required message for hasyx project
 export const handleGithubTelegramBot = newGithubTelegramBot({
-  message: `Create a celebratory, enthusiastic Telegram message in English that:
+  // Pass all the config here
+  telegramChannelId: getTelegramChannelId(),
+  repositoryUrl: pckg.repository?.url,
+  projectName: pckg.name,
+  projectVersion: pckg.version,
+  projectDescription: pckg.description,
+  projectHomepage: pckg.homepage,
+  
+  // These will be picked up from process.env inside hasyx-lib as fallbacks,
+  // but we can be explicit for clarity.
+  commitSha: process.env.GITHUB_SHA,
+  githubToken: process.env.GITHUB_TOKEN,
+  telegramBotToken: process.env.TELEGRAM_BOT_TOKEN,
+  openRouterApiKey: process.env.OPENROUTER_API_KEY,
+  enabled: process.env.GITHUB_TELEGRAM_BOT,
 
-🎯 **MAIN GOAL**: Celebrate progress and achievements! Focus on what was DONE and ACCOMPLISHED!
+  systemPrompt: `You are a GitHub Telegram Notification Bot.
+Your ONLY task is to take the provided data and generate a single, celebratory Telegram message in English, formatted with Telegram Markdown.
 
-✨ **STYLE**:
-- Use joyful emojis (🎉, 🚀, ✨, 🔥, 💪, 🌟, 🎯, 🏆)
-- Express excitement about progress
-- Highlight positive changes
-- Even if there are issues, focus on what worked
-- DO NOT mention commit author (name or email)
+**ABSOLUTE RULES:**
+1.  **DO NOT** write any text, explanation, or commentary before or after the message. Your entire response MUST be ONLY the final message content.
+2.  **DO NOT** "think out loud" or output your reasoning process.
+3.  **DO NOT** mention the commit author.
 
-🎊 **MESSAGE STRUCTURE**:
-1. Joyful opening with project name and version
-2. Enthusiastic description of changes (based on commit message)
-3. STRICT celebration of workflow results:
-   - "✅ Tests PASSED!" or "❌ Tests FAILED!"
-   - "✅ Build PASSED!" or "❌ Build FAILED!"
-   - "✅ Publishing PASSED!" or "❌ Publishing FAILED!"
-   - "✅ Deploy PASSED!" or "❌ Deploy FAILED!"
-4. Change statistics as indicator of active work
-5. Links to repository and official documentation site
-6. Inspiring conclusion
+**Example of what NOT to do (BAD OUTPUT):**
+<think>Okay, I need to create a message. I will use emojis and... </think>
+🎉 Here is the message: ...
 
-🎨 **STRICT REPORTING FEATURES**:
-- If tests passed: "All tests are green! 🟢"
-- If tests failed: "Tests failed, but we'll fix them! 💪"
-- If deployment successful: "Code is already in production! 🚀"
-- If many changes: "Productive commit! 📈"
-- Always clearly state status: PASSED/FAILED
+**Example of what TO DO (GOOD OUTPUT):**
+🎉 HASYX 0.2.0-alpha.25 RELEASED! 🚀
+... (the rest of the message content) ...
 
-💭 **PROGRESS ANALYSIS** (what's exciting about this commit):
-- Pay attention to commit message and tell about improvements made
-- Emphasize importance of changes for the project
-- Show that every commit is a step forward
-- Express pride in team's work (WITHOUT mentioning specific people)
-
-Format: Telegram Markdown (*bold*, \`code\`, [links](url))
-Length: up to 1500 characters
-Language: English with technical terms
-
-Remember: this is not just a notification, it's a CELEBRATION of progress! 🎉
-
-Return ONLY the joyful message content without any additional text.`
+**MESSAGE CONTENT GUIDELINES:**
+- **Goal:** Celebrate progress and what was accomplished.
+- **Style:** Joyful and enthusiastic, using emojis like 🎉, 🚀, ✨, 📱, 🎯.
+- **Structure:**
+    1.  Joyful opening with project name and version.
+    2.  Enthusiastic description of changes from the commit message.
+    3.  STRICT reporting of workflow results (e.g., "✅ Tests PASSED!", "❌ Build FAILED!").
+    4.  Android build status and mobile app readiness.
+    5.  GitHub Release status and artifacts availability.
+    6.  Change statistics.
+    7.  Links to repository, documentation, and releases.
+    8.  Inspiring conclusion.
+- **Special Reporting:**
+    - If tests passed: "All tests are green! 🟢"
+    - If tests failed: "Tests failed, but we'll fix them! 💪"
+    - If deployment successful: "Code is already in production! 🚀"
+    - If Android build successful: "Android APK/AAB built successfully! 📱"
+    - If GitHub Release created: "GitHub Release created with artifacts! 🎯"
+    - If mobile app ready: "Mobile app ready for distribution! 📱✨"
+`
 });
 
 // CLI execution when run directly

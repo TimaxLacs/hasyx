@@ -4,11 +4,24 @@ WebSocket туннелирование с автоматическим упра�
 
 ## ⚠️ КРИТИЧЕСКИ ВАЖНО: Системные требования
 
-### Обязательная установка wstunnel binary
+### Установка wstunnel binary
 
-**Wstunnel НЕ БУДЕТ РАБОТАТЬ без установленного системного binary!**
+**Автоматическая установка (рекомендуется):**
 
-Установите wstunnel binary перед использованием:
+```bash
+# Установить wstunnel автоматически
+npm run install-wstunnel
+```
+
+Скрипт автоматически определит вашу платформу и установит правильную версию в `~/bin/wstunnel`.
+
+**Не забудьте добавить `~/bin` в PATH:**
+```bash
+# Добавьте в ~/.zshrc или ~/.bashrc
+export PATH="$HOME/bin:$PATH"
+```
+
+**Ручная установка (если автоматическая не работает):**
 
 ```bash
 # Скачайте последнюю версию для вашей платформы
@@ -113,6 +126,40 @@ VERCEL=1
 
 ## Использование
 
+### CLI для локальной разработки (самый простой способ!)
+
+**Пробросить локальный порт на HTTPS поддомен:**
+
+```bash
+# Пробросить порт 3004 на https://my-app.deep.foundation
+npm run tunnel -- --port 3004 --uuid my-app --server https://deep.foundation
+
+# Или короткая форма
+npm run tunnel -- -p 3004 -u my-app
+
+# С автоматическим UUID
+npm run tunnel -- -p 3004
+
+# С аутентификацией
+npm run tunnel -- -p 3004 -u my-app -t YOUR_AUTH_TOKEN
+```
+
+**Что происходит:**
+1. 🔐 Регистрирует туннель на сервере (создает DNS, SSL, Nginx)
+2. 🔌 Подключает wstunnel client к серверу
+3. 🌐 Ваш `localhost:3004` доступен на `https://my-app.deep.foundation`
+
+**Пример с npm run dev:**
+```bash
+# Терминал 1: Запустить приложение
+npm run dev  # localhost:3004
+
+# Терминал 2: Пробросить через туннель
+npm run tunnel -- -p 3004 -u dev-app
+
+# Теперь доступно на https://dev-app.deep.foundation
+```
+
 ### Программный API
 
 ```typescript
@@ -160,6 +207,9 @@ await client.stop();   // Останавливает сервер и удаля�
 ```
 
 ## Безопасность
+
+### Admin-only Access
+Эндпоинт `/api/wstunnel/[uuid]` доступен только админам. Запрос должен содержать корректный аутентификационный контекст (JWT или cookie `next-auth`). На сервере выполняется проверка пользователя через `getTokenFromRequest` и `hasyx.isAdmin(userId)`. В случае отсутствия прав будет возвращён `401/403`.
 
 ### Vercel Protection
 Система автоматически блокирует выполнение в serverless Vercel окружении:

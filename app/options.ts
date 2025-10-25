@@ -4,19 +4,23 @@ import { NextAuthOptions } from 'next-auth';
 import 'next-auth';
 import 'next-auth/jwt';
 
-import { createAuthOptions } from 'hasyx/lib/auth-options';
+import { createAuthOptions } from 'hasyx/lib/users/auth-options';
 import { AppCredentialsProvider } from 'hasyx/lib/credentials';
-import { TelegramMiniappCredentialsProvider } from 'hasyx/lib/telegram-miniapp-server';
+import { TelegramMiniappCredentialsProvider } from 'hasyx/lib/telegram/telegram-miniapp-server';
 
 import schema from '../public/hasura-schema.json';
 
-const client = new Hasyx(createApolloClient({
-  secret: process.env.HASURA_ADMIN_SECRET!,
-}), Generator(schema));
+let authOptions: NextAuthOptions = { providers: [] }, client: Hasyx;
 
-const authOptions: NextAuthOptions = createAuthOptions([
-  AppCredentialsProvider({ hasyx: client }),
-  TelegramMiniappCredentialsProvider({ hasyx: client }),
-], client);
+if (process?.env?.NEXT_PUBLIC_HASURA_GRAPHQL_URL && process?.env?.HASURA_ADMIN_SECRET) {
+  client = new Hasyx(createApolloClient({
+    secret: process.env.HASURA_ADMIN_SECRET!,
+  }), Generator(schema));
+
+  authOptions = createAuthOptions([
+    AppCredentialsProvider({ hasyx: client }),
+    TelegramMiniappCredentialsProvider({ hasyx: client }),
+  ], client);
+}
 
 export default authOptions;
