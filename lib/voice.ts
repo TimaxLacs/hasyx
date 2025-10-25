@@ -6,9 +6,6 @@ import * as fs from 'fs';
 import { spawn, spawnSync, ChildProcessWithoutNullStreams } from 'child_process';
 import { fileURLToPath } from 'url';
 import http from 'http';
-import AdmZip from 'adm-zip';
-import type { Model, Recognizer } from 'vosk';
-import * as vosk from 'vosk';
 import https from 'https';
 import { Dialog, DialogEvent } from './ai/dialog';
 import { AIProvider } from './ai/ai';
@@ -17,6 +14,8 @@ import { TerminalTool } from './ai/tools/terminal-tool';
 import { createSystemPrompt } from './ai/core-prompts';
 import { Tool } from './ai/tool';
 import chalk from 'chalk';
+import { whisper as nodewhisper } from 'whisper-node';
+
 
 // ==================================================================================
 // PHASE 1, TASK 1.1: DEFINE INTERFACES AND STATES
@@ -67,19 +66,32 @@ export interface ITextToSpeech {
 // PHASE 1, TASK 1.3: CREATE DEFAULT IMPLEMENTATION CLASSES
 // ==================================================================================
 
-const DEFAULT_MODEL_STT = 'vosk-model-small-ru-0.22';
-const MODEL_PATH = path.resolve(__dirname, './models', DEFAULT_MODEL_STT);
 const SAMPLE_RATE = 16000;
+const WHISPER_MODEL = 'tiny'; // Более точная модель (~140MB), лучше для русского языка
+const MODEL_PATH = path.resolve(__dirname, '../node_modules/whisper-node/lib/whisper.cpp/models');
+const CHUNK_DURATION_MS = 2000; // Длительность аудиочанка для распознавания (3 секунды)
+const CALIBRATION_SAMPLES = 3; // Количество сэмплов для начальной калибровки
+const SILENCE_MULTIPLIER = 1.3; // Множитель для определения порога тишины (среднее * 1.5)
+const ADAPTATION_WEIGHT = 0.1; // Вес новых значений при адаптации (10%)
 
 /**
- * Реализация ITranscriber с использованием Vosk для локального распознавания речи.
+ * Реализация ITranscriber с использованием Whisper для локального распознавания речи.
  */
-class VoskTranscriber implements ITranscriber {
+class WhisperTranscriber implements ITranscriber {
     private audioDeviceManager: AudioDeviceManager;
-    private recognizer?: vosk.Recognizer<any>;
-    private model?: Model;
     private recordProcess?: ChildProcessWithoutNullStreams | any;
     private onResultCallback?: (text: string) => void;
+    private whisper?: any;
+    private audioChunks: Buffer[] = [];
+    private chunkStartTime: number = 0;
+    private isProcessing: boolean = false;
+    private tempAudioPath: string = path.join(__dirname, 'temp_chunk.wav');
+    
+    // Динамическая калибровка тишины
+    private calibrationSamples: number[] = [];
+    private isCalibrated: boolean = false;
+    private averageNoiseLevel: number = 0;
+    private silenceThreshold: number = 500; // Начальное значение
 
     constructor() {
         this.audioDeviceManager = new AudioDeviceManager();
@@ -87,12 +99,17 @@ class VoskTranscriber implements ITranscriber {
 
     async initialize(): Promise<void> {
         await this.audioDeviceManager.initialize();
+        
+        // Инициализация Whisper
         if (!fs.existsSync(MODEL_PATH)) {
-            await this.downloadModel();
+            fs.mkdirSync(MODEL_PATH, { recursive: true });
         }
-        vosk.setLogLevel(-1);
-        this.model = new vosk.Model(MODEL_PATH);
-        this.recognizer = new vosk.Recognizer({ model: this.model, sampleRate: SAMPLE_RATE });
+
+        console.log('🔧 Инициализация Whisper...');
+        // whisper-node использует функцию напрямую, а не конструктор
+        // Мы просто сохраняем ссылку на функцию для последующего использования
+        this.whisper = nodewhisper;
+        console.log('✅ Whisper готов к работе.');
     }
     
     async start(onResult: (text: string) => void): Promise<void> {
@@ -120,20 +137,20 @@ class VoskTranscriber implements ITranscriber {
             this.recordProcess = spawn(recordCommand[0], recordCommand.slice(1));
         }
 
+        this.chunkStartTime = Date.now();
+
         this.recordProcess.stdout.on('data', (data: Buffer) => {
-            if (this.recognizer?.acceptWaveform(data)) {
-                const result = this.recognizer.result();
-                    if (result && result.text) {
-                    this.onResultCallback?.(result.text);
-                }
-            } else {
-                const partialResult = this.recognizer?.partialResult();
-                // Optionally handle partial results if needed
+            this.audioChunks.push(data);
+            
+            // Проверяем, накопилось ли достаточно данных для распознавания
+            const elapsedTime = Date.now() - this.chunkStartTime;
+            if (elapsedTime >= CHUNK_DURATION_MS && !this.isProcessing) {
+                this.processAudioChunk();
             }
         });
 
         this.recordProcess.stderr.on('data', (data: Buffer) => {
-            console.error(`❌ Ошибка aplay/arecord: ${data}`);
+            console.error(`❌ Ошибка arecord: ${data}`);
         });
 
         this.recordProcess.on('close', (code: number) => {
@@ -143,36 +160,147 @@ class VoskTranscriber implements ITranscriber {
         });
     }
 
+    private calculateRMS(buffer: Buffer): number {
+        // Вычисляем RMS (Root Mean Square) для определения громкости
+        const samples = new Int16Array(buffer.buffer, buffer.byteOffset, buffer.length / 2);
+        let sum = 0;
+        for (let i = 0; i < samples.length; i++) {
+            sum += samples[i] * samples[i];
+        }
+        return Math.sqrt(sum / samples.length);
+    }
+
+    private async processAudioChunk(): Promise<void> {
+        if (this.audioChunks.length === 0 || this.isProcessing) return;
+        
+        this.isProcessing = true;
+        const audioData = Buffer.concat(this.audioChunks);
+        this.audioChunks = [];
+        this.chunkStartTime = Date.now();
+
+        // Вычисляем уровень громкости
+        const rmsLevel = this.calculateRMS(audioData);
+        
+        // Фаза калибровки
+        if (!this.isCalibrated) {
+            this.calibrationSamples.push(rmsLevel);
+            console.log(chalk.cyan(`🔧 Калибровка... (${this.calibrationSamples.length}/${CALIBRATION_SAMPLES}) Уровень: ${rmsLevel.toFixed(0)}`));
+            
+            if (this.calibrationSamples.length >= CALIBRATION_SAMPLES) {
+                // Вычисляем средний уровень шума
+                this.averageNoiseLevel = this.calibrationSamples.reduce((a, b) => a + b, 0) / this.calibrationSamples.length;
+                // Устанавливаем порог тишины как среднее * множитель
+                this.silenceThreshold = this.averageNoiseLevel * SILENCE_MULTIPLIER;
+                this.isCalibrated = true;
+                console.log(chalk.green(`✅ Калибровка завершена! Средний шум: ${this.averageNoiseLevel.toFixed(0)}, Порог тишины: ${this.silenceThreshold.toFixed(0)}`));
+            }
+            
+            this.isProcessing = false;
+            return;
+        }
+        
+        // Адаптивное обновление среднего уровня шума (только для тихих сэмплов)
+        if (rmsLevel < this.silenceThreshold) {
+            this.averageNoiseLevel = this.averageNoiseLevel * (1 - ADAPTATION_WEIGHT) + rmsLevel * ADAPTATION_WEIGHT;
+            this.silenceThreshold = this.averageNoiseLevel * SILENCE_MULTIPLIER;
+        }
+        
+        const isSilent = rmsLevel < this.silenceThreshold;
+        
+        console.log(chalk.gray(`📊 Уровень: ${rmsLevel.toFixed(0)} | Порог: ${this.silenceThreshold.toFixed(0)} | Шум: ${this.averageNoiseLevel.toFixed(0)} ${isSilent ? '🔇' : '🔊'}`));
+
+        // Пропускаем обработку если это тишина
+        if (isSilent) {
+            this.isProcessing = false;
+            return;
+        }
+
+        try {
+            // Сохраняем аудио во временный файл
+            await this.saveWavFile(audioData, this.tempAudioPath);
+            
+            console.log(chalk.blue(`🎙️ Отправка на распознавание...`));
+            
+            // Распознаем речь
+            const result = await this.whisper(this.tempAudioPath, {
+                modelPath: path.join(MODEL_PATH, `ggml-${WHISPER_MODEL}.bin`),
+                whisperOptions: {
+                    language: 'ru',
+                    gen_file_txt: false,
+                    gen_file_subtitle: false,
+                    gen_file_vtt: false,
+                    word_timestamps: false
+                }
+            });
+            
+            if (result && result.length > 0) {
+                const text = result[0]?.speech?.trim();
+                if (text) {
+                    console.log(chalk.yellow(`📝 Распознано: "${text}"`));
+                    if (this.onResultCallback) {
+                        this.onResultCallback(text);
+                    }
+                }
+            }
+        } catch (error) {
+            console.error('❌ Ошибка распознавания:', error);
+        } finally {
+            this.isProcessing = false;
+            // Удаляем временный файл
+            if (fs.existsSync(this.tempAudioPath)) {
+                fs.unlinkSync(this.tempAudioPath);
+            }
+        }
+    }
+
+    private async saveWavFile(audioData: Buffer, filePath: string): Promise<void> {
+        // Создаем WAV заголовок
+        const wavHeader = Buffer.alloc(44);
+        const dataSize = audioData.length;
+        const fileSize = dataSize + 36;
+
+        // RIFF chunk descriptor
+        wavHeader.write('RIFF', 0);
+        wavHeader.writeUInt32LE(fileSize, 4);
+        wavHeader.write('WAVE', 8);
+
+        // fmt sub-chunk
+        wavHeader.write('fmt ', 12);
+        wavHeader.writeUInt32LE(16, 16); // Subchunk1Size (16 for PCM)
+        wavHeader.writeUInt16LE(1, 20); // AudioFormat (1 for PCM)
+        wavHeader.writeUInt16LE(1, 22); // NumChannels (1 for mono)
+        wavHeader.writeUInt32LE(SAMPLE_RATE, 24); // SampleRate
+        wavHeader.writeUInt32LE(SAMPLE_RATE * 2, 28); // ByteRate
+        wavHeader.writeUInt16LE(2, 32); // BlockAlign
+        wavHeader.writeUInt16LE(16, 34); // BitsPerSample
+
+        // data sub-chunk
+        wavHeader.write('data', 36);
+        wavHeader.writeUInt32LE(dataSize, 40);
+
+        // Записываем файл
+        const wavFile = Buffer.concat([wavHeader, audioData]);
+        fs.writeFileSync(filePath, wavFile);
+    }
+
     async stop(): Promise<void> {
+        // Обрабатываем оставшиеся данные перед остановкой
+        if (this.audioChunks.length > 0 && !this.isProcessing) {
+            await this.processAudioChunk();
+        }
+        
         this.recordProcess?.kill();
         this.recordProcess = undefined;
     }
 
     async destroy(): Promise<void> {
         await this.stop();
-        this.recognizer?.free();
-        this.model?.free();
-    }
-    
-    private async downloadModel(): Promise<void> {
-        console.log('ℹ️ Модель отсутствует, запускаю установку...');
-        const modelUrl = `https://alphacephei.com/vosk/models/${DEFAULT_MODEL_STT}.zip`;
-        const zipPath = path.resolve(__dirname, './models/vosk-model.zip');
-        const modelsDir = path.resolve(__dirname, './models');
-        if (!fs.existsSync(modelsDir)) fs.mkdirSync(modelsDir, { recursive: true });
-
-        await new Promise<void>((resolve, reject) => {
-            https.get(modelUrl, (response) => {
-                const file = fs.createWriteStream(zipPath);
-                response.pipe(file);
-                file.on('finish', () => { file.close(); resolve(); });
-            }).on('error', reject);
-        });
-
-        const zip = new AdmZip(zipPath);
-        zip.extractAllTo(modelsDir, true);
-        fs.unlinkSync(zipPath);
-        console.log('✅ Модель успешно установлена.');
+        this.whisper = undefined;
+        
+        // Очистка временных файлов
+        if (fs.existsSync(this.tempAudioPath)) {
+            fs.unlinkSync(this.tempAudioPath);
+        }
     }
 }
 
@@ -300,14 +428,14 @@ class Voice {
             name: 'алиса',
             silenceThreshold: 2000,
             enableTranscription: true,
-            enableTTS: true,
+            enableTTS: false, // Временно отключено для тестирования
             useAnnouncerAI: false,
             ...options
         };
 
         this.audioDeviceManager = new AudioDeviceManager();
 
-        this.transcriber = this.options.transcriber || new VoskTranscriber();
+        this.transcriber = this.options.transcriber || new WhisperTranscriber();
         this.tts = this.options.tts || new ZonosTTSEngine(this.audioDeviceManager);
 
         if (!this.options.apikey && !process.env.OPENROUTER_API_KEY) {
@@ -471,8 +599,15 @@ class Voice {
                     textToSpeak = this.parseVoiceTags(event.content);
                 }
 
+                // Выводим ответ в консоль
+                console.log(chalk.green(`\n🤖 Ответ AI: ${event.content}`));
                 if (textToSpeak) {
-                    await this.tts.speak(textToSpeak);
+                    console.log(chalk.cyan(`\n🔊 Для озвучивания: "${textToSpeak}"`));
+                    
+                    // Озвучиваем только если TTS включен
+                    if (this.options.enableTTS) {
+                        await this.tts.speak(textToSpeak);
+                    }
                 }
                 this.state = VoiceState.LISTENING_FOR_KEYWORD;
                 break;
@@ -487,7 +622,12 @@ class Voice {
             case 'error':
                 console.error(chalk.red(`\n❌ Ошибка в диалоге: ${event.error}`));
                 this.state = VoiceState.SPEAKING;
-                await this.tts.speak("Произошла ошибка. Пожалуйста, попробуйте еще раз.");
+                
+                // Озвучиваем ошибку только если TTS включен
+                if (this.options.enableTTS) {
+                    await this.tts.speak("Произошла ошибка. Пожалуйста, попробуйте еще раз.");
+                }
+                
                 this.state = VoiceState.LISTENING_FOR_KEYWORD;
                 break;
         }
@@ -543,5 +683,4 @@ const voice = new Voice();
     console.error("[DEBUG] КРИТИЧЕСКАЯ ОШИБКА:", error);
     process.exit(1);
 });
-
 
