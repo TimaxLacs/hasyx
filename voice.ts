@@ -16,7 +16,6 @@ import { Tool } from './ai/tool';
 import chalk from 'chalk';
 import { whisper as nodewhisper } from 'whisper-node';
 
-
 // ==================================================================================
 // PHASE 1, TASK 1.1: DEFINE INTERFACES AND STATES
 // ==================================================================================
@@ -382,6 +381,87 @@ class ZonosTTSEngine implements ITextToSpeech {
 // ==================================================================================
 
 /**
+ * Менеджер команд - отвечает за обработку потока команд от STT
+ */
+class CommandManager {
+    private commandBuffer: string[] = [];
+    private lastSpeechTime: number = 0;
+    private silenceCheckInterval?: NodeJS.Timeout;
+    private onCommandReady?: (command: string) => void;
+    private onKeywordDetected?: () => void;
+    private keywordName: string;
+    private silenceThreshold: number;
+    private isRecording: boolean = false;
+
+    constructor(keywordName: string, silenceThreshold: number) {
+        this.keywordName = keywordName;
+        this.silenceThreshold = silenceThreshold;
+    }
+
+    /**
+     * Начать слушать команды с проверкой тишины
+     */
+    startCommandSession(onCommandReady: (command: string) => void, onKeywordDetected?: () => void): void {
+        this.onCommandReady = onCommandReady;
+        this.onKeywordDetected = onKeywordDetected;
+        this.isRecording = false;
+        
+        this.silenceCheckInterval = setInterval(() => {
+            if (this.isRecording && (Date.now() - this.lastSpeechTime) > this.silenceThreshold) {
+                const fullCommand = this.commandBuffer.join(' ').replace(this.keywordName, '').trim();
+                this.commandBuffer = [];
+                this.isRecording = false;
+                
+                if (fullCommand && this.onCommandReady) {
+                    this.onCommandReady(fullCommand);
+                }
+            }
+        }, 200);
+    }
+
+    /**
+     * Остановить сессию команд
+     */
+    stopCommandSession(): void {
+        if (this.silenceCheckInterval) {
+            clearInterval(this.silenceCheckInterval);
+            this.silenceCheckInterval = undefined;
+        }
+        this.commandBuffer = [];
+        this.isRecording = false;
+    }
+
+    /**
+     * Обработать текст от транскрибера
+     */
+    processTranscription(text: string): void {
+        const lowerText = text.toLowerCase();
+        if (!lowerText.trim()) return;
+
+        this.lastSpeechTime = Date.now();
+
+        if (!this.isRecording && lowerText.includes(this.keywordName)) {
+            console.log(`\n🎯 Ключевое слово "${this.keywordName}" обнаружено! Слушаю команду...`);
+            this.isRecording = true;
+            this.commandBuffer = [text];
+            if (this.onKeywordDetected) {
+                this.onKeywordDetected();
+            }
+        } else if (this.isRecording) {
+            process.stdout.write(`🎤 ... ${text}\n`);
+            this.commandBuffer.push(text);
+        }
+    }
+
+    /**
+     * Очистить все ресурсы
+     */
+    destroy(): void {
+        this.stopCommandSession();
+    }
+}
+
+/**
  * Опции для конфигурации экземпляра Voice.
  */
 interface VoiceOptions {
@@ -405,6 +485,8 @@ interface VoiceOptions {
     enableTTS?: boolean;
     /** Использовать ли второй AI для генерации кратких ответов. По умолчанию false. */
     useAnnouncerAI?: boolean;
+    /** Кастомный AI провайдер для тестирования. */
+    aiProvider?: any;
 }
 
 /**
@@ -414,14 +496,12 @@ interface VoiceOptions {
 class Voice {
     private state: VoiceState = VoiceState.IDLE;
     private options: VoiceOptions;
-    private transcriber: ITranscriber;
-    private tts: ITextToSpeech;
+    private transcriber?: ITranscriber;
+    private tts?: ITextToSpeech;
     private audioDeviceManager: AudioDeviceManager;
     private dialog?: Dialog;
     private aiProvider?: AIProvider;
-    private commandBuffer: string[] = [];
-    private lastSpeechTime: number = 0;
-    private silenceCheckInterval?: NodeJS.Timeout;
+    private commandManager?: CommandManager;
 
     constructor(options: VoiceOptions = {}) {
         this.options = {
@@ -435,17 +515,68 @@ class Voice {
 
         this.audioDeviceManager = new AudioDeviceManager();
 
-        this.transcriber = this.options.transcriber || new WhisperTranscriber();
-        this.tts = this.options.tts || new ZonosTTSEngine(this.audioDeviceManager);
+        // Инициализируем только нужные компоненты
+        if (this.options.enableTranscription) {
+            this.transcriber = this.options.transcriber || new WhisperTranscriber();
+        }
+        
+        if (this.options.enableTTS) {
+            this.tts = this.options.tts || new ZonosTTSEngine(this.audioDeviceManager);
+        }
 
-        if (!this.options.apikey && !process.env.OPENROUTER_API_KEY) {
+        // Используем кастомный AI провайдер, если предоставлен
+        if (this.options.aiProvider) {
+            this.aiProvider = this.options.aiProvider;
+            console.log("Используется кастомный AI провайдер для тестирования.");
+        } else if (!this.options.apikey && !process.env.OPENROUTER_API_KEY) {
             console.warn("API ключ не предоставлен. AI-функции будут недоступны.");
         } else {
             this.aiProvider = new OpenRouterProvider({
                 token: this.options.apikey || process.env.OPENROUTER_API_KEY || '',
-                model: this.options.model || 'google/gemini-flash-1.5',
+                model: this.options.model || 'deepseek/deepseek-chat-v3-0324:free',
             });
         }
+    }
+
+    /**
+     * Инициализирует ТОЛЬКО AI компонент.
+     */
+    public async initializeAI(): Promise<void> {
+        if (!this.aiProvider) {
+            console.error("AI Provider не настроен.");
+            return;
+        }
+        
+        this.initializeDialog();
+        console.log("✅ AI инициализирован.");
+    }
+
+    /**
+     * Инициализирует ТОЛЬКО STT компонент.
+     */
+    public async initializeSTT(): Promise<void> {
+        if (!this.transcriber) {
+            console.error("Transcriber не настроен. Установите enableTranscription: true");
+            return;
+        }
+        
+        await this.audioDeviceManager.initialize();
+        await this.transcriber.initialize();
+        console.log("✅ STT инициализирован.");
+    }
+
+    /**
+     * Инициализирует ТОЛЬКО TTS компонент.
+     */
+    public async initializeTTS(): Promise<void> {
+        if (!this.tts) {
+            console.error("TTS не настроен. Установите enableTTS: true");
+            return;
+        }
+        
+        await this.audioDeviceManager.initialize();
+        await this.tts.initialize();
+        console.log("✅ TTS инициализирован.");
     }
 
     /**
@@ -462,16 +593,16 @@ class Voice {
         this.state = VoiceState.INITIALIZING;
 
         try {
-            await this.audioDeviceManager.initialize();
-
+            // Инициализируем только включенные компоненты
             if (this.options.enableTranscription) {
-                await this.transcriber.initialize();
+                await this.initializeSTT();
             }
             if (this.options.enableTTS) {
-                await this.tts.initialize();
+                await this.initializeTTS();
             }
-            
-            this.initializeDialog();
+            if (this.aiProvider) {
+                await this.initializeAI();
+            }
 
             this.state = VoiceState.LISTENING_FOR_KEYWORD;
             console.log("✅ Ассистент инициализирован и готов к работе.");
@@ -482,34 +613,65 @@ class Voice {
     }
 
     /**
-     * Запускает основной цикл прослушивания микрофона.
+     * Запускает основной цикл прослушивания микрофона с автоматическим определением команд.
+     * Этот метод объединяет STT + обработку команд + AI
      */
     public async startListening(): Promise<void> {
-        if (this.state !== VoiceState.LISTENING_FOR_KEYWORD) {
-            console.warn(`Нельзя начать прослушивание в состоянии ${this.state}.`);
-                            return;
-                        }
-        if (!this.options.enableTranscription) {
-            console.log("Распознавание речи отключено. Прослушивание невозможно.");
-                            return;
-                        }
+        if (!this.transcriber) {
+            console.error("Transcriber не инициализирован. Вызовите initializeSTT() сначала.");
+            return;
+        }
 
         console.log(`👂 Ожидание ключевого слова "${this.options.name}"...`);
-        this.transcriber.start(this.handleTranscriptionResult.bind(this));
+        
+        // Создаем CommandManager для автоматической обработки
+        this.commandManager = new CommandManager(
+            this.options.name || 'алиса',
+            this.options.silenceThreshold || 2000
+        );
 
-        this.silenceCheckInterval = setInterval(async () => {
-            if (this.state === VoiceState.RECORDING_COMMAND && (Date.now() - this.lastSpeechTime) > (this.options.silenceThreshold || 2000)) {
-                const fullCommand = this.commandBuffer.join(' ').replace(this.options.name || 'алиса', '').trim();
-                this.commandBuffer = [];
-                
-                if (fullCommand) {
-                    await this.ask(fullCommand);
-                } else {
-                    console.log("Команда не распознана, возврат в режим ожидания.");
-                    this.state = VoiceState.LISTENING_FOR_KEYWORD;
-                }
+        // Запускаем сессию с колбэком на готовую команду
+        this.commandManager.startCommandSession(
+            async (command: string) => {
+                this.state = VoiceState.AWAITING_AI_RESPONSE;
+                await this.ask(command);
+            },
+            () => {
+                this.state = VoiceState.RECORDING_COMMAND;
             }
-        }, 200);
+        );
+
+        // Запускаем transcriber с передачей текста в CommandManager
+        await this.transcriber.start((text: string) => {
+            this.commandManager?.processTranscription(text);
+        });
+    }
+
+    /**
+     * Запускает ТОЛЬКО прослушивание без обработки команд.
+     * Результаты приходят через колбэк.
+     */
+    public async startListeningRaw(onTranscription: (text: string) => void): Promise<void> {
+        if (!this.transcriber) {
+            console.error("Transcriber не инициализирован. Вызовите initializeSTT() сначала.");
+            return;
+        }
+
+        console.log(`🎙️ Запуск прослушивания (raw режим)...`);
+        await this.transcriber.start(onTranscription);
+    }
+
+    /**
+     * Останавливает прослушивание.
+     */
+    public async stopListening(): Promise<void> {
+        if (this.transcriber) {
+            await this.transcriber.stop();
+        }
+        if (this.commandManager) {
+            this.commandManager.stopCommandSession();
+        }
+        console.log("⏹️ Прослушивание остановлено.");
     }
 
     /**
@@ -518,20 +680,41 @@ class Voice {
     public async destroy(): Promise<void> {
         if (this.state === VoiceState.IDLE) return;
         
-        if (this.silenceCheckInterval) {
-            clearInterval(this.silenceCheckInterval);
-            this.silenceCheckInterval = undefined;
-        }
-        
         console.log("Освобождение ресурсов...");
         this.state = VoiceState.DESTROYING;
 
-        await this.transcriber.destroy();
-        await this.tts.destroy();
+        if (this.commandManager) {
+            this.commandManager.destroy();
+            this.commandManager = undefined;
+        }
+
+        if (this.transcriber) {
+            await this.transcriber.destroy();
+        }
+        
+        if (this.tts) {
+            await this.tts.destroy();
+        }
+        
         this.dialog = undefined;
         
         this.state = VoiceState.IDLE;
         console.log("✅ Ресурсы освобождены.");
+    }
+
+    /**
+     * Озвучивает текст через TTS.
+     * @param text - Текст для озвучивания.
+     */
+    public async speak(text: string): Promise<void> {
+        if (!this.tts) {
+            console.error("TTS не инициализирован. Вызовите initializeTTS() сначала.");
+            return;
+        }
+        
+        this.state = VoiceState.SPEAKING;
+        await this.tts.speak(text);
+        this.state = VoiceState.LISTENING_FOR_KEYWORD;
     }
 
     /**
@@ -605,7 +788,7 @@ class Voice {
                     console.log(chalk.cyan(`\n🔊 Для озвучивания: "${textToSpeak}"`));
                     
                     // Озвучиваем только если TTS включен
-                    if (this.options.enableTTS) {
+                    if (this.options.enableTTS && this.tts) {
                         await this.tts.speak(textToSpeak);
                     }
                 }
@@ -624,7 +807,7 @@ class Voice {
                 this.state = VoiceState.SPEAKING;
                 
                 // Озвучиваем ошибку только если TTS включен
-                if (this.options.enableTTS) {
+                if (this.options.enableTTS && this.tts) {
                     await this.tts.speak("Произошла ошибка. Пожалуйста, попробуйте еще раз.");
                 }
                 
@@ -637,40 +820,25 @@ class Voice {
         const match = text.match(/<VOICE>([\s\S]*?)<\/VOICE>/);
         return match ? match[1].trim() : null;
     }
-
-    private handleTranscriptionResult(text: string): void {
-        const lowerText = text.toLowerCase();
-        
-        if (!lowerText.trim()) return;
-
-        this.lastSpeechTime = Date.now();
-
-        if (this.state === VoiceState.LISTENING_FOR_KEYWORD && lowerText.includes(this.options.name || 'алиса')) {
-            console.log(`\n🎯 Ключевое слово "${this.options.name}" обнаружено! Слушаю команду...`);
-            this.state = VoiceState.RECORDING_COMMAND;
-            this.commandBuffer = [text];
-        } else if (this.state === VoiceState.RECORDING_COMMAND) {
-            process.stdout.write(`🎤 ... ${text}\n`);
-            this.commandBuffer.push(text);
-        }
-    }
 }
 
 export default Voice;
 
-console.log('[DEBUG] Файл lib/voice.ts загружен. Запуск основного блока...');
+// ==================================================================================
+// ПРИМЕРЫ ИСПОЛЬЗОВАНИЯ
+// ==================================================================================
 
-const voice = new Voice();
-
-// Self-execution block for running with `npx tsx lib/voice.ts`
-(async () => {
-    console.log("[DEBUG] Внутри async блока. Запуск голосового ассистента...");
+// РЕЖИМ 1: Полный голосовой ассистент (STT + AI + TTS)
+async function runFullVoiceAssistant() {
+    console.log("\n🎯 РЕЖИМ 1: Полный голосовой ассистент (STT + AI + TTS)\n");
     
+    const voice = new Voice({
+        enableTranscription: true,
+        enableTTS: false, // Временно отключено
+    });
+
     await voice.initialize();
-    console.log("[DEBUG] voice.initialize() завершен.");
-    
     await voice.startListening();
-    console.log("[DEBUG] voice.startListening() запущен.");
 
     console.log("Ассистент запущен. Нажмите Ctrl+C для выхода.");
 
@@ -679,8 +847,105 @@ const voice = new Voice();
         await voice.destroy();
         process.exit(0);
     });
-})().catch(error => {
-    console.error("[DEBUG] КРИТИЧЕСКАЯ ОШИБКА:", error);
-    process.exit(1);
-});
+}
+
+// РЕЖИМ 2: Только AI + TTS (ввод через консоль)
+async function runConsoleWithTTS() {
+    console.log("\n🎯 РЕЖИМ 2: AI + TTS (ввод через консоль)\n");
+    
+    const voice = new Voice({
+        enableTranscription: false,
+        enableTTS: true,
+    });
+
+    await voice.initializeAI();
+    await voice.initializeTTS();
+
+    const readline = require('readline');
+    const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout
+    });
+
+    console.log("Введите команду (или 'exit' для выхода):");
+    
+    rl.on('line', async (input: string) => {
+        if (input.toLowerCase() === 'exit') {
+            await voice.destroy();
+            process.exit(0);
+        }
+        
+        await voice.ask(input);
+    });
+
+    process.on('SIGINT', async () => {
+        console.log("\nПолучен сигнал SIGINT. Завершение работы...");
+        await voice.destroy();
+        process.exit(0);
+    });
+}
+
+// РЕЖИМ 3: Только STT + AI (вывод в консоль)
+async function runVoiceWithConsoleOutput() {
+    console.log("\n🎯 РЕЖИМ 3: STT + AI (голосовой ввод, вывод в консоль)\n");
+    
+    const voice = new Voice({
+        enableTranscription: true,
+        enableTTS: false,
+    });
+
+    await voice.initializeSTT();
+    await voice.initializeAI();
+    await voice.startListening();
+
+    console.log("Говорите команды. Ответы будут в консоли. Ctrl+C для выхода.");
+
+    process.on('SIGINT', async () => {
+        console.log("\nПолучен сигнал SIGINT. Завершение работы...");
+        await voice.destroy();
+        process.exit(0);
+    });
+}
+
+// РЕЖИМ 4: Только STT (raw режим с кастомной обработкой)
+async function runSTTOnly() {
+    console.log("\n🎯 РЕЖИМ 4: Только STT (raw режим)\n");
+    
+    const voice = new Voice({
+        enableTranscription: true,
+        enableTTS: false,
+    });
+
+    await voice.initializeSTT();
+    
+    await voice.startListeningRaw((text: string) => {
+        console.log(`📝 Распознано: "${text}"`);
+        // Здесь пользователь может добавить свою логику обработки
+    });
+
+    console.log("Говорите что-нибудь. Результаты появятся в консоли. Ctrl+C для выхода.");
+
+    process.on('SIGINT', async () => {
+        console.log("\nПолучен сигнал SIGINT. Завершение работы...");
+        await voice.destroy();
+        process.exit(0);
+    });
+}
+
+// Если файл запущен напрямую, запускаем примеры
+if (require.main === module) {
+    console.log('[DEBUG] Файл lib/voice.ts загружен. Запуск основного блока...');
+    
+    // Запускаем по умолчанию полный ассистент
+    runFullVoiceAssistant().catch(error => {
+        console.error("[DEBUG] КРИТИЧЕСКАЯ ОШИБКА:", error);
+        process.exit(1);
+    });
+
+    // Раскомментируйте нужный режим:
+    // runConsoleWithTTS().catch(console.error);
+    // runVoiceWithConsoleOutput().catch(console.error);
+    // runSTTOnly().catch(console.error);
+}
+
 
